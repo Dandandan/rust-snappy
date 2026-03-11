@@ -186,6 +186,13 @@ impl<'s, 'd> Decompress<'s, 'd> {
     }
 
     /// Fast decompression loop using raw pointers for common cases.
+    ///
+    /// The loop condition guarantees sufficient headroom in both source and
+    /// destination buffers to eliminate most bounds checks from the loop body:
+    /// - `s + 17 <= src_len`: ensures 16 bytes of literal data + 1 tag byte
+    ///   can always be read, and 4 bytes of copy offset data (since 17 > 5).
+    /// - `d + 88 <= dst_len`: ensures max copy (64 bytes) + overlapping_copy
+    ///   wiggle room (24 bytes) always fits, so no destination checks needed.
     #[inline(always)]
     unsafe fn decompress_fast(&mut self) -> Result<()> {
         let src = self.src.as_ptr();
@@ -193,15 +200,14 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let src_len = self.src.len();
         let dst_len = self.dst.len();
 
-        while self.s + 5 <= src_len {
+        while self.s + 17 <= src_len && self.d + 88 <= dst_len {
             let byte = *src.add(self.s);
 
             if byte & 3 == 0 {
                 let len = (byte >> 2) as usize + 1;
-                if len <= 16
-                    && self.s + 1 + 16 <= src_len
-                    && self.d + 16 <= dst_len
-                {
+                if len <= 16 {
+                    // Always safe: loop condition guarantees
+                    // s + 1 + 16 <= src_len and d + 16 <= dst_len.
                     self.s += 1;
                     ptr::copy_nonoverlapping(
                         src.add(self.s),
@@ -213,10 +219,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     continue;
                 }
                 // Medium-fast path for literals len 17-60.
-                if len <= 60
-                    && self.s + 1 + len + 16 <= src_len
-                    && self.d + len + 16 <= dst_len
-                {
+                // Destination is guaranteed safe by loop condition
+                // (d + 76 <= d + 88 <= dst_len). Source needs checking.
+                if len <= 60 && self.s + 1 + len + 16 <= src_len {
                     self.s += 1;
                     wide_copy(src.add(self.s), dst.add(self.d), len);
                     self.s += len;
@@ -232,12 +237,10 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let tag_type = (byte & 3) as usize;
             let num_tag_bytes = tag_type + (tag_type == 3) as usize;
             let len = entry_val & 0xFF;
-            let s_tag = self.s;
             self.s += 1;
 
-            // Safety: The loop condition `self.s + 5 <= src_len` (checked
-            // before self.s was modified) guarantees that at least 4 bytes
-            // are available at src + self.s for the offset read.
+            // Safety: loop condition guarantees s + 17 <= src_len,
+            // so after s += 1 there are at least 16 >= 4 bytes available.
             let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
             let trailer = bytes::loadu_u32_le(src.add(self.s)) as usize
                 & mask as usize;
@@ -251,7 +254,18 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 });
             }
 
-            if offset >= 8 && len <= 16 && self.d + 16 <= dst_len {
+            // All destination bounds are guaranteed by the loop condition
+            // (d + 88 <= dst_len covers max copy 64 + 24 wiggle room).
+            if len <= 16 && offset >= 16 {
+                // Single 128-bit non-overlapping copy (compiles to ldr q/str q).
+                let dstp = dst.add(self.d);
+                ptr::copy_nonoverlapping(dstp.sub(offset), dstp, 16);
+                self.d += len;
+                continue;
+            }
+
+            if offset >= 8 && len <= 16 {
+                // For offset 8-15: two 64-bit copies to avoid UB from overlap.
                 let dstp = dst.add(self.d);
                 let srcp = dstp.sub(offset);
                 ptr::copy_nonoverlapping(srcp, dstp, 8);
@@ -260,23 +274,15 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 continue;
             }
 
-            // Medium copies (len 17-64, offset >= 16): no overlap.
-            if offset >= 16 && self.d + len + 16 <= dst_len {
+            if offset >= 16 {
                 let dstp = dst.add(self.d);
                 wide_copy(dstp.sub(offset), dstp, len);
                 self.d += len;
                 continue;
             }
 
-            let end = self.d + len;
-            if end + 24 <= dst_len {
-                overlapping_copy(dst.add(self.d), offset, len);
-                self.d = end;
-                continue;
-            }
-
-            self.s = s_tag + 1;
-            self.read_copy(byte)?;
+            overlapping_copy(dst.add(self.d), offset, len);
+            self.d += len;
         }
         Ok(())
     }
