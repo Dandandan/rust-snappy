@@ -256,14 +256,52 @@ impl<'s, 'd> Decompress<'s, 'd> {
         // loads/stores.
         if offset >= 8 && len <= 16 && self.d + 16 <= self.dst.len() {
             unsafe {
+                // SAFETY: We know dstp points to at least 16 bytes of memory
+                // from the condition above, and we also know that dstp is
+                // preceded by at least `offset` bytes from the `d <= offset`
+                // check above.
+                //
+                // We also know that dstp and dstp-8 do not overlap from the
+                // check above, justifying the use of copy_nonoverlapping.
                 let dstp = self.dst.as_mut_ptr().add(self.d);
                 let srcp = dstp.sub(offset);
+                // We can't do a single 16 byte load/store because src/dst may
+                // overlap with each other. Namely, the second copy here may
+                // copy bytes written in the first copy!
                 ptr::copy_nonoverlapping(srcp, dstp, 8);
                 ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
             }
+        // If we have some wiggle room, try to decompress the copy 16 bytes
+        // at a time with 128 bit unaligned loads/stores. Remember, we can't
+        // just do a memcpy because decompressing copies may require copying
+        // overlapping memory.
+        //
+        // We need the extra wiggle room to make effective use of 128 bit
+        // loads/stores. Even if the store ends up copying more data than we
+        // need, we're careful to advance `d` by the correct amount at the end.
         } else if end + 24 <= self.dst.len() {
             unsafe {
+                // SAFETY: We know that dstp is preceded by at least `offset`
+                // bytes from the `d <= offset` check above.
+                //
+                // We don't know whether dstp overlaps with srcp, so we start
+                // by copying from srcp to dstp until they no longer overlap.
+                // The worst case is when dstp-src = 3 and copy length = 1. The
+                // first loop will issue these copy operations before stopping:
+                //
+                //   [-1, 14] -> [0, 15]
+                //   [-1, 14] -> [3, 18]
+                //   [-1, 14] -> [9, 24]
+                //
+                // But the copy had length 1, so it was only supposed to write
+                // to [0, 0]. But the last copy wrote to [9, 24], which is 24
+                // extra bytes in dst *beyond* the end of the copy, which is
+                // guaranteed by the conditional above.
+
+                // Save destination length here to avoid a reborrow UB violation
+                // under the Tree Borrows model.
                 let dest_len = self.dst.len();
+
                 let mut dstp = self.dst.as_mut_ptr().add(self.d);
                 let mut srcp = dstp.sub(offset);
                 loop {
@@ -272,6 +310,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     if diff >= 16 {
                         break;
                     }
+                    // srcp and dstp can overlap, so use ptr::copy.
                     debug_assert!(self.d + 16 <= dest_len);
                     ptr::copy(srcp, dstp, 16);
                     self.d += diff as usize;
@@ -283,6 +322,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     dstp = dstp.add(16);
                     self.d += 16;
                 }
+                // At this point, `d` is likely wrong. We correct it before
+                // returning. It's correct value is `end`.
             }
         } else {
             if end > self.dst.len() {
@@ -291,6 +332,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     dst_len: (self.dst.len() - self.d) as u64,
                 });
             }
+            // Finally, the slow byte-by-byte case, which should only be used
+            // for the last few bytes of decompression.
             while self.d != end {
                 self.dst[self.d] = self.dst[self.d - offset];
                 self.d += 1;
