@@ -180,6 +180,36 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     self.d += len;
                     continue;
                 }
+                // Medium-fast path for literals with len 17-60:
+                // unrolled 16-byte copies, avoiding the overhead of
+                // read_literal's bounds checks and extended-length handling.
+                if len <= 60
+                    && self.s + 1 + len + 16 <= src_len
+                    && self.d + len + 16 <= dst_len
+                {
+                    self.s += 1;
+                    let srcp = src.add(self.s);
+                    let dstp = dst.add(self.d);
+                    ptr::copy_nonoverlapping(srcp, dstp, 16);
+                    ptr::copy_nonoverlapping(srcp.add(16), dstp.add(16), 16);
+                    if len > 32 {
+                        ptr::copy_nonoverlapping(
+                            srcp.add(32),
+                            dstp.add(32),
+                            16,
+                        );
+                        if len > 48 {
+                            ptr::copy_nonoverlapping(
+                                srcp.add(48),
+                                dstp.add(48),
+                                16,
+                            );
+                        }
+                    }
+                    self.s += len;
+                    self.d += len;
+                    continue;
+                }
                 // Slow path: extended literals or near boundaries
                 self.s += 1;
                 self.read_literal(len)?;
@@ -197,9 +227,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
 
             if self.s + 4 <= src_len {
                 let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
-                let trailer =
-                    bytes::loadu_u32_le(src.add(self.s)) as usize
-                        & mask as usize;
+                let trailer = bytes::loadu_u32_le(src.add(self.s)) as usize
+                    & mask as usize;
                 let offset = (entry_val & 0x700) | trailer;
                 self.s += num_tag_bytes;
 
@@ -215,6 +244,32 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     let srcp = dstp.sub(offset);
                     ptr::copy_nonoverlapping(srcp, dstp, 8);
                     ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
+                    self.d += len;
+                    continue;
+                }
+
+                // Fast path for medium copies (len 17-64, offset >= 16).
+                // Two 16-byte non-overlapping copies handle up to 32 bytes.
+                // Four handle up to 64 (max copy-2 length).
+                if offset >= 16 && self.d + len + 16 <= dst_len {
+                    let dstp = dst.add(self.d);
+                    let srcp = dstp.sub(offset);
+                    ptr::copy_nonoverlapping(srcp, dstp, 16);
+                    ptr::copy_nonoverlapping(srcp.add(16), dstp.add(16), 16);
+                    if len > 32 {
+                        ptr::copy_nonoverlapping(
+                            srcp.add(32),
+                            dstp.add(32),
+                            16,
+                        );
+                        if len > 48 {
+                            ptr::copy_nonoverlapping(
+                                srcp.add(48),
+                                dstp.add(48),
+                                16,
+                            );
+                        }
+                    }
                     self.d += len;
                     continue;
                 }
@@ -369,20 +424,27 @@ impl<'s, 'd> Decompress<'s, 'd> {
         // loads/stores.
         if offset >= 8 && len <= 16 && self.d + 16 <= self.dst.len() {
             unsafe {
-                // SAFETY: We know dstp points to at least 16 bytes of memory
-                // from the condition above, and we also know that dstp is
-                // preceded by at least `offset` bytes from the `d <= offset`
-                // check above.
-                //
-                // We also know that dstp and dstp-8 do not overlap from the
-                // check above, justifying the use of copy_nonoverlapping.
                 let dstp = self.dst.as_mut_ptr().add(self.d);
                 let srcp = dstp.sub(offset);
-                // We can't do a single 16 byte load/store because src/dst may
-                // overlap with each other. Namely, the second copy here may
-                // copy bytes written in the first copy!
                 ptr::copy_nonoverlapping(srcp, dstp, 8);
                 ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
+            }
+        } else if offset >= 16 && end + 16 <= self.dst.len() {
+            unsafe {
+                let dstp = self.dst.as_mut_ptr().add(self.d);
+                let srcp = dstp.sub(offset);
+                ptr::copy_nonoverlapping(srcp, dstp, 16);
+                ptr::copy_nonoverlapping(srcp.add(16), dstp.add(16), 16);
+                if len > 32 {
+                    ptr::copy_nonoverlapping(srcp.add(32), dstp.add(32), 16);
+                    if len > 48 {
+                        ptr::copy_nonoverlapping(
+                            srcp.add(48),
+                            dstp.add(48),
+                            16,
+                        );
+                    }
+                }
             }
         // If we have some wiggle room, try to decompress the copy 16 bytes
         // at a time with 128 bit unaligned loads/stores. Remember, we can't
