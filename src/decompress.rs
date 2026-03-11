@@ -9,68 +9,6 @@ use crate::MAX_INPUT_SIZE;
 /// tag byte.
 const TAG_LOOKUP_TABLE: TagLookupTable = TagLookupTable(tag::TAG_LOOKUP_TABLE);
 
-/// Combined length-and-offset table inspired by C++ snappy's kLengthMinusOffset.
-///
-/// For each tag byte, encodes (as i16):
-///   - Short literals (len 1-16): `length - 256` (always negative)
-///   - Copy-1: `length - (offset_high_bits << 8)`
-///   - Copy-2 (len 1-16): `length`
-///   - Extended literals, long copies, copy-4: flag value (0x0180)
-///
-/// The key property: for common tags (short literals and copies where
-/// offset > length), `entry <= ExtractOffset(trailing_bytes, tag_type)`,
-/// allowing a single unified code path without branching on tag type.
-const LENGTH_MINUS_OFFSET: [i16; 256] = make_length_minus_offset();
-
-const fn make_length_minus_offset() -> [i16; 256] {
-    let mut table = [0i16; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let tag = i as u8;
-        let tag_type = tag & 3;
-        if tag_type == 0 {
-            // Literal
-            let lit_len = (tag >> 2) + 1;
-            if lit_len <= 16 {
-                // Common short literal: entry = len - 256 (negative)
-                table[i] = (lit_len as i16) - 256;
-            } else {
-                // Long/extended literal: exit to slow path
-                table[i] = 0x0180u16 as i16;
-            }
-        } else if tag_type == 1 {
-            // Copy-1: len 4-11, offset has high bits in tag
-            let len = (4 + ((tag >> 2) & 7)) as i16;
-            let offset_high = ((tag >> 5) & 7) as i16;
-            table[i] = len - (offset_high << 8);
-        } else if tag_type == 2 {
-            // Copy-2
-            let len = (1 + (tag >> 2)) as i16;
-            if len <= 16 {
-                table[i] = len;
-            } else {
-                // Long copy-2: exit to slow path
-                table[i] = 0x0180u16 as i16;
-            }
-        } else {
-            // Copy-4: exit to slow path
-            table[i] = 0x0180u16 as i16;
-        }
-        i += 1;
-    }
-    table
-}
-
-/// Extract copy offset from trailing bytes using a packed 64-bit mask constant.
-/// Returns 0 for literals, low byte for copy-1, full u16 for copy-2, 0 for copy-4.
-#[inline(always)]
-fn extract_offset(val: u32, tag_type: usize) -> u32 {
-    const MASKS: u64 = 0x0000FFFF00FF0000u64;
-    let mask = ((MASKS >> (tag_type * 16)) & 0xFFFF) as u32;
-    val & mask
-}
-
-
 /// Returns the decompressed size (in bytes) of the compressed bytes given.
 ///
 /// `input` must be a sequence of bytes returned by a conforming Snappy
@@ -290,9 +228,16 @@ impl<'s, 'd> Decompress<'s, 'd> {
         // Find the copy offset and len, then advance the input past the copy.
         // The rest of this function deals with reading/writing to output only.
         let entry = TAG_LOOKUP_TABLE.entry(tag_byte);
-        let offset = entry.offset(self.src, self.s)?;
+        // Compute num_tag_bytes from tag_type directly (1→1, 2→2, 3→4)
+        // instead of from entry.num_tag_bytes(). This is available as soon
+        // as the tag byte is loaded, breaking the serial dependency:
+        // tag → table_load → extract_num_tag_bytes → compute_mask.
+        let tag_type = (tag_byte & 3) as usize;
+        // tag_type: 1→1, 2→2, 3→4 trailing bytes
+        let num_tag_bytes = tag_type + (tag_type == 3) as usize;
+        let offset = entry.offset_with_ntb(self.src, self.s, num_tag_bytes)?;
         let len = entry.len();
-        self.s += entry.num_tag_bytes();
+        self.s += num_tag_bytes;
 
         // What we really care about here is whether `d == 0` or `d < offset`.
         // To save an extra branch, use `d < offset - 1` instead. If `d` is
@@ -426,12 +371,6 @@ impl TagLookupTable {
 struct TagEntry(usize);
 
 impl TagEntry {
-    /// Return the total number of bytes proceding this tag byte required to
-    /// encode the offset.
-    fn num_tag_bytes(&self) -> usize {
-        self.0 >> 11
-    }
-
     /// Return the total copy length, capped at 255.
     fn len(&self) -> usize {
         self.0 & 0xFF
@@ -443,8 +382,15 @@ impl TagEntry {
     ///
     /// This requires reading from the compressed input since the offset is
     /// encoded in bytes proceding the tag byte.
-    fn offset(&self, src: &[u8], s: usize) -> Result<usize> {
-        let num_tag_bytes = self.num_tag_bytes();
+    ///
+    /// `num_tag_bytes` is passed in directly (computed from `tag & 3`)
+    /// to break the serial dependency through the table entry.
+    fn offset_with_ntb(
+        &self,
+        src: &[u8],
+        s: usize,
+        num_tag_bytes: usize,
+    ) -> Result<usize> {
         let trailer =
             // It is critical for this case to come first, since it is the
             // fast path. We really hope that this case gets branch
