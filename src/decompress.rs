@@ -25,6 +25,32 @@ unsafe fn wide_copy(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
+/// Copy `len` bytes from `dst - offset` into `dst`, handling overlapping
+/// regions by expanding with `ptr::copy` until the gap >= 16, then
+/// switching to non-overlapping 16-byte chunks.
+///
+/// Caller must ensure `dst + len + 24` is writable and that `dst` is
+/// preceded by at least `offset` valid bytes.
+#[inline(always)]
+unsafe fn overlapping_copy(dst: *mut u8, offset: usize, len: usize) {
+    let end = dst.add(len);
+    let mut dstp = dst;
+    let mut srcp = dst.sub(offset);
+    loop {
+        let diff = (dstp as usize) - (srcp as usize);
+        if diff >= 16 {
+            break;
+        }
+        ptr::copy(srcp, dstp, 16);
+        dstp = dstp.add(diff);
+    }
+    while dstp < end {
+        ptr::copy_nonoverlapping(srcp, dstp, 16);
+        srcp = srcp.add(16);
+        dstp = dstp.add(16);
+    }
+}
+
 /// Returns the decompressed size (in bytes) of the compressed bytes given.
 ///
 /// `input` must be a sequence of bytes returned by a conforming Snappy
@@ -243,23 +269,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 // Long copies with offset >= 8
                 let end = self.d + len;
                 if offset >= 8 && end + 24 <= dst_len {
-                    let mut dstp = dst.add(self.d);
-                    let mut srcp = dstp.sub(offset);
-                    loop {
-                        let diff = (dstp as usize) - (srcp as usize);
-                        if diff >= 16 {
-                            break;
-                        }
-                        ptr::copy(srcp, dstp, 16);
-                        self.d += diff;
-                        dstp = dstp.add(diff);
-                    }
-                    while self.d < end {
-                        ptr::copy_nonoverlapping(srcp, dstp, 16);
-                        srcp = srcp.add(16);
-                        dstp = dstp.add(16);
-                        self.d += 16;
-                    }
+                    overlapping_copy(dst.add(self.d), offset, len);
                     self.d = end;
                     continue;
                 }
@@ -404,49 +414,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
         // need, we're careful to advance `d` by the correct amount at the end.
         } else if end + 24 <= self.dst.len() {
             unsafe {
-                // SAFETY: We know that dstp is preceded by at least `offset`
-                // bytes from the `d <= offset` check above.
-                //
-                // We don't know whether dstp overlaps with srcp, so we start
-                // by copying from srcp to dstp until they no longer overlap.
-                // The worst case is when dstp-src = 3 and copy length = 1. The
-                // first loop will issue these copy operations before stopping:
-                //
-                //   [-1, 14] -> [0, 15]
-                //   [-1, 14] -> [3, 18]
-                //   [-1, 14] -> [9, 24]
-                //
-                // But the copy had length 1, so it was only supposed to write
-                // to [0, 0]. But the last copy wrote to [9, 24], which is 24
-                // extra bytes in dst *beyond* the end of the copy, which is
-                // guaranteed by the conditional above.
-
-                // Save destination length here to avoid a reborrow UB violation
-                // under the Tree Borrows model.
-                let dest_len = self.dst.len();
-
-                let mut dstp = self.dst.as_mut_ptr().add(self.d);
-                let mut srcp = dstp.sub(offset);
-                loop {
-                    debug_assert!(dstp >= srcp);
-                    let diff = (dstp as usize) - (srcp as usize);
-                    if diff >= 16 {
-                        break;
-                    }
-                    // srcp and dstp can overlap, so use ptr::copy.
-                    debug_assert!(self.d + 16 <= dest_len);
-                    ptr::copy(srcp, dstp, 16);
-                    self.d += diff as usize;
-                    dstp = dstp.add(diff);
-                }
-                while self.d < end {
-                    ptr::copy_nonoverlapping(srcp, dstp, 16);
-                    srcp = srcp.add(16);
-                    dstp = dstp.add(16);
-                    self.d += 16;
-                }
-                // At this point, `d` is likely wrong. We correct it before
-                // returning. It's correct value is `end`.
+                overlapping_copy(self.dst.as_mut_ptr().add(self.d), offset, len);
             }
         } else {
             if end > self.dst.len() {
