@@ -212,8 +212,17 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let src_len = self.src.len();
         let dst_len = self.dst.len();
 
-        while self.s + 17 <= src_len && self.d + 88 <= dst_len {
-            let byte = *src.add(self.s);
+        if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
+            return Ok(());
+        }
+
+        // C++ preload trick: carry the current tag byte forward from
+        // the previous iteration's trailer load, avoiding a separate
+        // memory load per tag.
+        let mut preload = *src.add(self.s) as u32;
+
+        loop {
+            let byte = preload as u8;
 
             if byte & 3 == 0 {
                 let len = (byte >> 2) as usize + 1;
@@ -226,17 +235,20 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     );
                     self.s += len;
                     self.d += len;
-                    continue;
-                }
-                if len <= 60 && self.s + 1 + len + 16 <= src_len {
+                } else if len <= 60 && self.s + 1 + len + 16 <= src_len {
                     self.s += 1;
                     wide_copy(src.add(self.s), dst.add(self.d), len);
                     self.s += len;
                     self.d += len;
-                    continue;
+                } else {
+                    self.s += 1;
+                    self.read_literal(len)?;
                 }
-                self.s += 1;
-                self.read_literal(len)?;
+                // Literals: can't preload, must reload next tag.
+                if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
+                    break;
+                }
+                preload = *src.add(self.s) as u32;
                 continue;
             }
 
@@ -246,12 +258,10 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let len = entry_val & 0xFF;
             self.s += 1;
 
-            // Packed constant for offset mask (C++ ExtractOffset style).
-            // Replaces the dependency chain tag_type → ntb → shift → mask
-            // with a shorter tag_type → shift → AND.
-            let trailer = bytes::loadu_u32_le(src.add(self.s));
+            // Load 4 bytes: trailer data + (for Copy1/Copy2) next tag byte.
+            let loaded = bytes::loadu_u32_le(src.add(self.s));
             let extracted =
-                (trailer & extract_offset_mask(tag_type)) as usize;
+                (loaded & extract_offset_mask(tag_type)) as usize;
             let offset = (entry_val & 0x700) | extracted;
             self.s += num_tag_bytes;
 
@@ -266,27 +276,39 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 let dstp = dst.add(self.d);
                 ptr::copy_nonoverlapping(dstp.sub(offset), dstp, 16);
                 self.d += len;
-                continue;
-            }
-
-            if offset >= 8 && len <= 16 {
+            } else if offset >= 8 && len <= 16 {
                 let dstp = dst.add(self.d);
                 let srcp = dstp.sub(offset);
                 ptr::copy_nonoverlapping(srcp, dstp, 8);
                 ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
                 self.d += len;
-                continue;
-            }
-
-            if offset >= 16 {
+            } else if offset >= 16 {
                 let dstp = dst.add(self.d);
                 wide_copy(dstp.sub(offset), dstp, len);
                 self.d += len;
-                continue;
+            } else {
+                overlapping_copy(dst.add(self.d), offset, len);
+                self.d += len;
             }
 
-            overlapping_copy(dst.add(self.d), offset, len);
-            self.d += len;
+            // Preload trick: extract next tag byte from the already-loaded
+            // u32 trailer. For Copy1 (ntb=1): next tag at loaded byte 1.
+            // For Copy2 (ntb=2): next tag at loaded byte 2.
+            // Shift by tag_type*8 bits (works for Copy1/Copy2).
+            // For Copy4 (ntb=4, ~0% of data): shift gives wrong byte,
+            // so reload.
+            preload = loaded >> (tag_type as u32 * 8);
+            if tag_type == 3 {
+                // Copy4: next tag byte not in our 4-byte load, reload.
+                if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
+                    break;
+                }
+                preload = *src.add(self.s) as u32;
+            }
+
+            if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
+                break;
+            }
         }
         Ok(())
     }
