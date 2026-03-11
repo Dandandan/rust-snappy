@@ -252,58 +252,81 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 continue;
             }
 
-            let entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
-            let tag_type = (byte & 3) as usize;
-            let num_tag_bytes = tag_type + (tag_type == 3) as usize;
-            let len = entry_val & 0xFF;
-            self.s += 1;
+            if byte & 3 == 2 {
+                // Copy2: most common copy tag (~55% of URL data).
+                // Compute len and offset directly, no table lookup needed.
+                let len = 1 + ((byte >> 2) as usize);
+                self.s += 1;
+                let loaded = bytes::loadu_u32_le(src.add(self.s));
+                let offset = (loaded & 0xFFFF) as usize;
+                self.s += 2;
 
-            // Load 4 bytes: trailer data + (for Copy1/Copy2) next tag byte.
-            let loaded = bytes::loadu_u32_le(src.add(self.s));
-            let extracted =
-                (loaded & extract_offset_mask(tag_type)) as usize;
-            let offset = (entry_val & 0x700) | extracted;
-            self.s += num_tag_bytes;
-
-            if self.d <= offset.wrapping_sub(1) {
-                return Err(Error::Offset {
-                    offset: offset as u64,
-                    dst_pos: self.d as u64,
-                });
-            }
-
-            if len <= 16 && offset >= 16 {
-                let dstp = dst.add(self.d);
-                ptr::copy_nonoverlapping(dstp.sub(offset), dstp, 16);
-                self.d += len;
-            } else if offset >= 8 && len <= 16 {
-                let dstp = dst.add(self.d);
-                let srcp = dstp.sub(offset);
-                ptr::copy_nonoverlapping(srcp, dstp, 8);
-                ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
-                self.d += len;
-            } else if offset >= 16 {
-                let dstp = dst.add(self.d);
-                wide_copy(dstp.sub(offset), dstp, len);
-                self.d += len;
-            } else {
-                overlapping_copy(dst.add(self.d), offset, len);
-                self.d += len;
-            }
-
-            // Preload trick: extract next tag byte from the already-loaded
-            // u32 trailer. For Copy1 (ntb=1): next tag at loaded byte 1.
-            // For Copy2 (ntb=2): next tag at loaded byte 2.
-            // Shift by tag_type*8 bits (works for Copy1/Copy2).
-            // For Copy4 (ntb=4, ~0% of data): shift gives wrong byte,
-            // so reload.
-            preload = loaded >> (tag_type as u32 * 8);
-            if tag_type == 3 {
-                // Copy4: next tag byte not in our 4-byte load, reload.
-                if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
-                    break;
+                if self.d <= offset.wrapping_sub(1) {
+                    return Err(Error::Offset {
+                        offset: offset as u64,
+                        dst_pos: self.d as u64,
+                    });
                 }
-                preload = *src.add(self.s) as u32;
+
+                if len <= 16 && offset >= 8 {
+                    let dstp = dst.add(self.d);
+                    let srcp = dstp.sub(offset);
+                    ptr::copy_nonoverlapping(srcp, dstp, 8);
+                    ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
+                    self.d += len;
+                } else if offset >= 16 {
+                    let dstp = dst.add(self.d);
+                    wide_copy(dstp.sub(offset), dstp, len);
+                    self.d += len;
+                } else {
+                    overlapping_copy(dst.add(self.d), offset, len);
+                    self.d += len;
+                }
+
+                preload = loaded >> 16;
+            } else {
+                // Copy1 (~13.5%) and Copy4 (~0%).
+                let entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
+                let tag_type = (byte & 3) as usize;
+                let num_tag_bytes = tag_type + (tag_type == 3) as usize;
+                let len = entry_val & 0xFF;
+                self.s += 1;
+
+                let loaded = bytes::loadu_u32_le(src.add(self.s));
+                let extracted =
+                    (loaded & extract_offset_mask(tag_type)) as usize;
+                let offset = (entry_val & 0x700) | extracted;
+                self.s += num_tag_bytes;
+
+                if self.d <= offset.wrapping_sub(1) {
+                    return Err(Error::Offset {
+                        offset: offset as u64,
+                        dst_pos: self.d as u64,
+                    });
+                }
+
+                if len <= 16 && offset >= 8 {
+                    let dstp = dst.add(self.d);
+                    let srcp = dstp.sub(offset);
+                    ptr::copy_nonoverlapping(srcp, dstp, 8);
+                    ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
+                    self.d += len;
+                } else if offset >= 16 {
+                    let dstp = dst.add(self.d);
+                    wide_copy(dstp.sub(offset), dstp, len);
+                    self.d += len;
+                } else {
+                    overlapping_copy(dst.add(self.d), offset, len);
+                    self.d += len;
+                }
+
+                preload = loaded >> (tag_type as u32 * 8);
+                if tag_type == 3 {
+                    if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
+                        break;
+                    }
+                    preload = *src.add(self.s) as u32;
+                }
             }
 
             if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
