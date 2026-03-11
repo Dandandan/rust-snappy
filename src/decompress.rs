@@ -225,11 +225,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let mut preload = *ip as u32;
 
         loop {
-            // Hint to the compiler that preload is already zero-extended,
-            // avoiding a redundant AND instruction on aarch64 (LLVM bug 51317).
-            #[cfg(target_arch = "aarch64")]
-            core::arch::asm!("", in(reg) preload, options(nomem, nostack, preserves_flags));
-
             let byte = preload as u8;
 
             if byte & 3 == 0 {
