@@ -150,9 +150,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
 
     /// Fast decompression loop using raw pointers.
     ///
-    /// Handles common cases (small literals, copies with offset >= 8 and
-    /// len <= 16) with minimal per-tag overhead. For uncommon cases, calls
-    /// the original methods and continues the fast loop.
+    /// Handles common cases with minimal per-tag overhead. For uncommon
+    /// cases (extended literals, copy-4, near boundaries), calls the
+    /// original methods and continues.
     #[inline(always)]
     unsafe fn decompress_fast(&mut self) -> Result<()> {
         let src = self.src.as_ptr();
@@ -195,7 +195,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
 
             // Check we can read the trailer
             if self.s + 4 > src_len {
-                // Near end, fall back to safe read_copy
                 self.s -= 1;
                 self.s += 1;
                 self.read_copy(byte)?;
@@ -217,21 +216,55 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 });
             }
 
+            let end = self.d + len;
+
             if offset >= 8 && len <= 16 && self.d + 16 <= dst_len {
                 // Fast copy: two non-overlapping 8-byte copies
                 let dstp = dst.add(self.d);
                 let srcp = dstp.sub(offset);
                 ptr::copy_nonoverlapping(srcp, dstp, 8);
                 ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
-                self.d += len;
+                self.d = end;
                 continue;
             }
 
-            // Slow path for complex copies (small offset, large len,
-            // or near dst boundary). Reconstruct state for read_copy.
-            self.s -= num_tag_bytes + 1;
-            self.s += 1;
-            self.read_copy(byte)?;
+            // Handle remaining copy cases inline to avoid re-computing
+            // offset/len in read_copy.
+            if end + 24 <= dst_len {
+                let mut dstp = dst.add(self.d);
+                let mut srcp = dstp.sub(offset);
+                // First expand overlapping region to >= 16 bytes
+                loop {
+                    let diff = (dstp as usize) - (srcp as usize);
+                    if diff >= 16 {
+                        break;
+                    }
+                    ptr::copy(srcp, dstp, 16);
+                    self.d += diff;
+                    dstp = dstp.add(diff);
+                }
+                // Then copy 16 at a time (non-overlapping)
+                while self.d < end {
+                    ptr::copy_nonoverlapping(srcp, dstp, 16);
+                    srcp = srcp.add(16);
+                    dstp = dstp.add(16);
+                    self.d += 16;
+                }
+                self.d = end;
+                continue;
+            }
+
+            // Near dst boundary: byte-by-byte
+            if end > dst_len {
+                return Err(Error::CopyWrite {
+                    len: len as u64,
+                    dst_len: (dst_len - self.d) as u64,
+                });
+            }
+            while self.d != end {
+                *dst.add(self.d) = *dst.add(self.d - offset);
+                self.d += 1;
+            }
         }
         Ok(())
     }
