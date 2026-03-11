@@ -9,12 +9,67 @@ use crate::MAX_INPUT_SIZE;
 /// tag byte.
 const TAG_LOOKUP_TABLE: TagLookupTable = TagLookupTable(tag::TAG_LOOKUP_TABLE);
 
-/// `WORD_MASK` is a map from the size of an integer in bytes to its
-/// corresponding on a 32 bit integer. This is used when we need to read an
-/// integer and we know there are at least 4 bytes to read from a buffer. In
-/// this case, we can read a 32 bit little endian integer and mask out only the
-/// bits we need. This in particular saves a branch.
-const WORD_MASK: [usize; 5] = [0, 0xFF, 0xFFFF, 0xFFFFFF, 0xFFFFFFFF];
+/// Combined length-and-offset table inspired by C++ snappy's kLengthMinusOffset.
+///
+/// For each tag byte, encodes (as i16):
+///   - Short literals (len 1-16): `length - 256` (always negative)
+///   - Copy-1: `length - (offset_high_bits << 8)`
+///   - Copy-2 (len 1-16): `length`
+///   - Extended literals, long copies, copy-4: flag value (0x0180)
+///
+/// The key property: for common tags (short literals and copies where
+/// offset > length), `entry <= ExtractOffset(trailing_bytes, tag_type)`,
+/// allowing a single unified code path without branching on tag type.
+const LENGTH_MINUS_OFFSET: [i16; 256] = make_length_minus_offset();
+
+const fn make_length_minus_offset() -> [i16; 256] {
+    let mut table = [0i16; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let tag = i as u8;
+        let tag_type = tag & 3;
+        if tag_type == 0 {
+            // Literal
+            let lit_len = (tag >> 2) + 1;
+            if lit_len <= 16 {
+                // Common short literal: entry = len - 256 (negative)
+                table[i] = (lit_len as i16) - 256;
+            } else {
+                // Long/extended literal: exit to slow path
+                table[i] = 0x0180u16 as i16;
+            }
+        } else if tag_type == 1 {
+            // Copy-1: len 4-11, offset has high bits in tag
+            let len = (4 + ((tag >> 2) & 7)) as i16;
+            let offset_high = ((tag >> 5) & 7) as i16;
+            table[i] = len - (offset_high << 8);
+        } else if tag_type == 2 {
+            // Copy-2
+            let len = (1 + (tag >> 2)) as i16;
+            if len <= 16 {
+                table[i] = len;
+            } else {
+                // Long copy-2: exit to slow path
+                table[i] = 0x0180u16 as i16;
+            }
+        } else {
+            // Copy-4: exit to slow path
+            table[i] = 0x0180u16 as i16;
+        }
+        i += 1;
+    }
+    table
+}
+
+/// Extract copy offset from trailing bytes using a packed 64-bit mask constant.
+/// Returns 0 for literals, low byte for copy-1, full u16 for copy-2, 0 for copy-4.
+#[inline(always)]
+fn extract_offset(val: u32, tag_type: usize) -> u32 {
+    const MASKS: u64 = 0x0000FFFF00FF0000u64;
+    let mask = ((MASKS >> (tag_type * 16)) & 0xFFFF) as u32;
+    val & mask
+}
+
 
 /// Returns the decompressed size (in bytes) of the compressed bytes given.
 ///
@@ -128,7 +183,99 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// This assumes that the header has already been read and that `dst` is
     /// big enough to store all decompressed bytes.
     fn decompress(&mut self) -> Result<()> {
-        while self.s < self.src.len() {
+        let src_len = self.src.len();
+        let dst_len = self.dst.len();
+
+        // Fast unified loop: processes short literals and copies through
+        // a single code path using the LENGTH_MINUS_OFFSET table.
+        // The key insight (from C++ snappy): by encoding literal entries
+        // as `length - 256`, both literals and copies satisfy
+        // `entry <= extracted` in the common case, eliminating the need
+        // to branch on tag type for most of the processing.
+        'outer: loop {
+            // Headroom: need 2 bytes for u16 trailing load, plus up to
+            // 16 bytes for literal source data.
+            while self.s + 18 <= src_len && self.d + 16 <= dst_len {
+                // SAFETY: headroom check guarantees src[s], src[s+1..s+2]
+                // (for u16 load), and dst[d..d+16] are in bounds.
+                unsafe {
+                    let tag = *self.src.get_unchecked(self.s);
+                    let tag_type = (tag & 3) as usize;
+                    let entry = *LENGTH_MINUS_OFFSET.get_unchecked(tag as usize);
+
+                    let old_s = self.s + 1;
+                    let next = u16::from_le(
+                        (self.src.as_ptr().add(old_s) as *const u16)
+                            .read_unaligned(),
+                    ) as u32;
+
+                    let len = (entry & 0xFF) as usize;
+                    if len > 16 {
+                        break;
+                    }
+                    let extracted = extract_offset(next, tag_type) as i16;
+
+                    // Catches: pattern-extension copies (offset < len),
+                    // long literals/copies, extended literals, copy-4.
+                    if entry > extracted {
+                        break;
+                    }
+
+                    // For copies: len_min_offset = len - full_offset
+                    // For literals: len_min_offset = len - 256
+                    let len_min_offset = (entry - extracted) as isize;
+                    let full_offset =
+                        (len as isize - len_min_offset) as usize;
+
+                    // Validate copy offset: need offset <= d AND offset >= 8
+                    // (offset < 8 requires pattern-extension handling).
+                    // For literals tag_type == 0, so this is skipped.
+                    if tag_type != 0
+                        && (full_offset < 8 || full_offset > self.d)
+                    {
+                        break;
+                    }
+
+                    // delta = d - full_offset (copy source position)
+                    // For literals: d - 256 (garbage, but masked away)
+                    let delta = self.d.wrapping_sub(full_offset);
+
+                    // Branchless source pointer selection via bitmask
+                    let tag_mask =
+                        0usize.wrapping_sub((tag_type != 0) as usize);
+                    let copy_src =
+                        (self.dst.as_ptr() as usize).wrapping_add(delta);
+                    let lit_src =
+                        self.src.as_ptr() as usize + old_s;
+                    let from = ((copy_src & tag_mask)
+                        | (lit_src & !tag_mask))
+                        as *const u8;
+
+                    let dstp = self.dst.as_mut_ptr().add(self.d);
+                    ptr::copy_nonoverlapping(from, dstp, 8);
+                    ptr::copy_nonoverlapping(
+                        from.add(8),
+                        dstp.add(8),
+                        8,
+                    );
+
+                    // Advance input: literal skips len data bytes,
+                    // copy skips tag_type trailing bytes.
+                    // This branch is the only tag-type-dependent operation
+                    // AFTER the memory copy, minimizing misprediction cost.
+                    if tag_type == 0 {
+                        self.s = old_s + len;
+                    } else {
+                        self.s = old_s + tag_type;
+                    }
+                    self.d += len;
+                }
+            }
+
+            // Slow path: handle one tag, then re-enter the fast loop.
+            if self.s >= src_len {
+                break 'outer;
+            }
             let byte = self.src[self.s];
             self.s += 1;
             if byte & 0b000000_11 == 0 {
@@ -138,9 +285,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 self.read_copy(byte)?;
             }
         }
-        if self.d != self.dst.len() {
+        if self.d != dst_len {
             return Err(Error::HeaderMismatch {
-                expected_len: self.dst.len() as u64,
+                expected_len: dst_len as u64,
                 got_len: self.d as u64,
             });
         }
@@ -199,8 +346,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
             // Since we know there are 4 bytes left to read, read a 32 bit LE
             // integer and mask away the bits we don't need.
             let byte_count = len as usize - 60;
+            let mask = u32::MAX >> ((4 - byte_count as u32) << 3);
             len = bytes::read_u32_le(&self.src[self.s..]) as u64;
-            len = (len & (WORD_MASK[byte_count] as u64)) + 1;
+            len = (len & mask as u64) + 1;
             self.s += byte_count;
         }
         // If there's not enough buffer left to load or store this literal,
@@ -255,52 +403,14 @@ impl<'s, 'd> Decompress<'s, 'd> {
         // loads/stores.
         if offset >= 8 && len <= 16 && self.d + 16 <= self.dst.len() {
             unsafe {
-                // SAFETY: We know dstp points to at least 16 bytes of memory
-                // from the condition above, and we also know that dstp is
-                // preceded by at least `offset` bytes from the `d <= offset`
-                // check above.
-                //
-                // We also know that dstp and dstp-8 do not overlap from the
-                // check above, justifying the use of copy_nonoverlapping.
                 let dstp = self.dst.as_mut_ptr().add(self.d);
                 let srcp = dstp.sub(offset);
-                // We can't do a single 16 byte load/store because src/dst may
-                // overlap with each other. Namely, the second copy here may
-                // copy bytes written in the first copy!
                 ptr::copy_nonoverlapping(srcp, dstp, 8);
                 ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
             }
-        // If we have some wiggle room, try to decompress the copy 16 bytes
-        // at a time with 128 bit unaligned loads/stores. Remember, we can't
-        // just do a memcpy because decompressing copies may require copying
-        // overlapping memory.
-        //
-        // We need the extra wiggle room to make effective use of 128 bit
-        // loads/stores. Even if the store ends up copying more data than we
-        // need, we're careful to advance `d` by the correct amount at the end.
         } else if end + 24 <= self.dst.len() {
             unsafe {
-                // SAFETY: We know that dstp is preceded by at least `offset`
-                // bytes from the `d <= offset` check above.
-                //
-                // We don't know whether dstp overlaps with srcp, so we start
-                // by copying from srcp to dstp until they no longer overlap.
-                // The worst case is when dstp-src = 3 and copy length = 1. The
-                // first loop will issue these copy operations before stopping:
-                //
-                //   [-1, 14] -> [0, 15]
-                //   [-1, 14] -> [3, 18]
-                //   [-1, 14] -> [9, 24]
-                //
-                // But the copy had length 1, so it was only supposed to write
-                // to [0, 0]. But the last copy wrote to [9, 24], which is 24
-                // extra bytes in dst *beyond* the end of the copy, which is
-                // guaranteed by the conditional above.
-
-                // Save destination length here to avoid a reborrow UB violation
-                // under the Tree Borrows model.
                 let dest_len = self.dst.len();
-
                 let mut dstp = self.dst.as_mut_ptr().add(self.d);
                 let mut srcp = dstp.sub(offset);
                 loop {
@@ -309,7 +419,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     if diff >= 16 {
                         break;
                     }
-                    // srcp and dstp can overlap, so use ptr::copy.
                     debug_assert!(self.d + 16 <= dest_len);
                     ptr::copy(srcp, dstp, 16);
                     self.d += diff as usize;
@@ -321,8 +430,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     dstp = dstp.add(16);
                     self.d += 16;
                 }
-                // At this point, `d` is likely wrong. We correct it before
-                // returning. It's correct value is `end`.
             }
         } else {
             if end > self.dst.len() {
@@ -331,8 +438,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     dst_len: (self.dst.len() - self.d) as u64,
                 });
             }
-            // Finally, the slow byte-by-byte case, which should only be used
-            // for the last few bytes of decompression.
             while self.d != end {
                 self.dst[self.d] = self.dst[self.d - offset];
                 self.d += 1;
@@ -441,12 +546,12 @@ impl TagEntry {
                     // SAFETY: The conditional above guarantees that
                     // src[s..s+4] is valid to read from.
                     let p = src.as_ptr().add(s);
-                    // We use WORD_MASK here to mask out the bits we don't
-                    // need. While we're guaranteed to read 4 valid bytes,
-                    // not all of those bytes are necessarily part of the
-                    // offset. This is the key optimization: we don't need to
-                    // branch on num_tag_bytes.
-                    bytes::loadu_u32_le(p) as usize & WORD_MASK[num_tag_bytes]
+                    // Mask to extract only the bytes we need from the u32.
+                    // num_tag_bytes is 1, 2, or 4 for copy tags, so the
+                    // shift is always 24, 16, or 0 (all < 32).
+                    // This avoids a table lookup on the critical path.
+                    let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
+                    bytes::loadu_u32_le(p) as usize & mask as usize
                 }
             } else if num_tag_bytes == 1 {
                 if s >= src.len() {
