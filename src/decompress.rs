@@ -25,6 +25,16 @@ unsafe fn wide_copy(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
+
+/// Extract the offset mask for a given tag_type (1, 2, or 3) using a
+/// packed constant, avoiding the dependency chain through num_tag_bytes.
+/// Returns a mask: tag_type=1 → 0xFF, tag_type=2 → 0xFFFF, tag_type=3 → 0.
+#[inline(always)]
+fn extract_offset_mask(tag_type: usize) -> u32 {
+    const MASKS_PACKED: u64 = 0x0000FFFF00FF0000u64;
+    ((MASKS_PACKED >> (tag_type * 16)) & 0xFFFF) as u32
+}
+
 /// Copy `len` bytes from `dst - offset` into `dst`, handling overlapping
 /// regions by expanding with `ptr::copy` until the gap >= 16, then
 /// switching to non-overlapping 16-byte chunks.
@@ -187,6 +197,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
 
     /// Fast decompression loop using raw pointers for common cases.
     ///
+    /// Fast decompression loop using raw pointers for common cases.
+    ///
     /// The loop condition guarantees sufficient headroom in both source and
     /// destination buffers to eliminate most bounds checks from the loop body:
     /// - `s + 17 <= src_len`: ensures 16 bytes of literal data + 1 tag byte
@@ -200,17 +212,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let src_len = self.src.len();
         let dst_len = self.dst.len();
 
-        if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
-            return Ok(());
-        }
+        while self.s + 17 <= src_len && self.d + 88 <= dst_len {
+            let byte = *src.add(self.s);
 
-        // Software-pipelined loop: pre-load the current tag byte and its
-        // table entry so that after each copy/literal the next iteration's
-        // loads are already in flight.
-        let mut byte = *src.add(self.s);
-        let mut entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
-
-        loop {
             if byte & 3 == 0 {
                 let len = (byte >> 2) as usize + 1;
                 if len <= 16 {
@@ -222,33 +226,33 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     );
                     self.s += len;
                     self.d += len;
-                } else if len <= 60 && self.s + 1 + len + 16 <= src_len {
+                    continue;
+                }
+                if len <= 60 && self.s + 1 + len + 16 <= src_len {
                     self.s += 1;
                     wide_copy(src.add(self.s), dst.add(self.d), len);
                     self.s += len;
                     self.d += len;
-                } else {
-                    self.s += 1;
-                    self.read_literal(len)?;
+                    continue;
                 }
-                // Re-check loop condition, then pre-load next tag.
-                if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
-                    break;
-                }
-                byte = *src.add(self.s);
-                entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
+                self.s += 1;
+                self.read_literal(len)?;
                 continue;
             }
 
+            let entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
             let tag_type = (byte & 3) as usize;
             let num_tag_bytes = tag_type + (tag_type == 3) as usize;
             let len = entry_val & 0xFF;
             self.s += 1;
 
-            let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
-            let trailer = bytes::loadu_u32_le(src.add(self.s)) as usize
-                & mask as usize;
-            let offset = (entry_val & 0x700) | trailer;
+            // Packed constant for offset mask (C++ ExtractOffset style).
+            // Replaces the dependency chain tag_type → ntb → shift → mask
+            // with a shorter tag_type → shift → AND.
+            let trailer = bytes::loadu_u32_le(src.add(self.s));
+            let extracted =
+                (trailer & extract_offset_mask(tag_type)) as usize;
+            let offset = (entry_val & 0x700) | extracted;
             self.s += num_tag_bytes;
 
             if self.d <= offset.wrapping_sub(1) {
@@ -258,39 +262,31 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 });
             }
 
-            // Pre-load next tag byte and table entry BEFORE the copy,
-            // so the ~4-cycle table lookup overlaps with the copy operation.
-            // Safety: self.s is valid (we'll re-check the loop condition
-            // after the copy, but reading one byte past the end is safe
-            // because src_len >= s + 17 held at loop entry and we advanced
-            // at most 5 bytes).
-            byte = *src.add(self.s);
-            entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
-
-            // All destination bounds are guaranteed by the loop condition
-            // (d + 88 <= dst_len covers max copy 64 + 24 wiggle room).
             if len <= 16 && offset >= 16 {
                 let dstp = dst.add(self.d);
                 ptr::copy_nonoverlapping(dstp.sub(offset), dstp, 16);
                 self.d += len;
-            } else if offset >= 8 && len <= 16 {
+                continue;
+            }
+
+            if offset >= 8 && len <= 16 {
                 let dstp = dst.add(self.d);
                 let srcp = dstp.sub(offset);
                 ptr::copy_nonoverlapping(srcp, dstp, 8);
                 ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
                 self.d += len;
-            } else if offset >= 16 {
+                continue;
+            }
+
+            if offset >= 16 {
                 let dstp = dst.add(self.d);
                 wide_copy(dstp.sub(offset), dstp, len);
                 self.d += len;
-            } else {
-                overlapping_copy(dst.add(self.d), offset, len);
-                self.d += len;
+                continue;
             }
 
-            if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
-                break;
-            }
+            overlapping_copy(dst.add(self.d), offset, len);
+            self.d += len;
         }
         Ok(())
     }
