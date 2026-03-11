@@ -235,43 +235,44 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let s_tag = self.s;
             self.s += 1;
 
-            if self.s + 4 <= src_len {
-                let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
-                let trailer = bytes::loadu_u32_le(src.add(self.s)) as usize
-                    & mask as usize;
-                let offset = (entry_val & 0x700) | trailer;
-                self.s += num_tag_bytes;
+            // Safety: The loop condition `self.s + 5 <= src_len` (checked
+            // before self.s was modified) guarantees that at least 4 bytes
+            // are available at src + self.s for the offset read.
+            let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
+            let trailer = bytes::loadu_u32_le(src.add(self.s)) as usize
+                & mask as usize;
+            let offset = (entry_val & 0x700) | trailer;
+            self.s += num_tag_bytes;
 
-                if self.d <= offset.wrapping_sub(1) {
-                    return Err(Error::Offset {
-                        offset: offset as u64,
-                        dst_pos: self.d as u64,
-                    });
-                }
+            if self.d <= offset.wrapping_sub(1) {
+                return Err(Error::Offset {
+                    offset: offset as u64,
+                    dst_pos: self.d as u64,
+                });
+            }
 
-                if offset >= 8 && len <= 16 && self.d + 16 <= dst_len {
-                    let dstp = dst.add(self.d);
-                    let srcp = dstp.sub(offset);
-                    ptr::copy_nonoverlapping(srcp, dstp, 8);
-                    ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
-                    self.d += len;
-                    continue;
-                }
+            if offset >= 8 && len <= 16 && self.d + 16 <= dst_len {
+                let dstp = dst.add(self.d);
+                let srcp = dstp.sub(offset);
+                ptr::copy_nonoverlapping(srcp, dstp, 8);
+                ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
+                self.d += len;
+                continue;
+            }
 
-                // Medium copies (len 17-64, offset >= 16): no overlap.
-                if offset >= 16 && self.d + len + 16 <= dst_len {
-                    let dstp = dst.add(self.d);
-                    wide_copy(dstp.sub(offset), dstp, len);
-                    self.d += len;
-                    continue;
-                }
+            // Medium copies (len 17-64, offset >= 16): no overlap.
+            if offset >= 16 && self.d + len + 16 <= dst_len {
+                let dstp = dst.add(self.d);
+                wide_copy(dstp.sub(offset), dstp, len);
+                self.d += len;
+                continue;
+            }
 
-                let end = self.d + len;
-                if end + 24 <= dst_len {
-                    overlapping_copy(dst.add(self.d), offset, len);
-                    self.d = end;
-                    continue;
-                }
+            let end = self.d + len;
+            if end + 24 <= dst_len {
+                overlapping_copy(dst.add(self.d), offset, len);
+                self.d = end;
+                continue;
             }
 
             self.s = s_tag + 1;
