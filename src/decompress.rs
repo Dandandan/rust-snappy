@@ -266,9 +266,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     continue;
                 }
 
-                // Long copies with offset >= 8
                 let end = self.d + len;
-                if offset >= 8 && end + 24 <= dst_len {
+                if end + 24 <= dst_len {
                     overlapping_copy(dst.add(self.d), offset, len);
                     self.d = end;
                     continue;
