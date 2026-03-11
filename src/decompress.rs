@@ -208,50 +208,55 @@ impl<'s, 'd> Decompress<'s, 'd> {
     #[inline(always)]
     unsafe fn decompress_fast(&mut self) -> Result<()> {
         let src = self.src.as_ptr();
-        let dst = self.dst.as_mut_ptr();
+        let dst_base = self.dst.as_mut_ptr();
         let src_len = self.src.len();
         let dst_len = self.dst.len();
 
         if src_len < 17 || dst_len < 88 {
             return Ok(());
         }
-        // Precompute loop limits to avoid additions in the hot loop.
-        let src_limit = src_len - 17;
-        let dst_limit = dst_len - 88;
 
-        // C++ preload trick: carry the current tag byte forward from
-        // the previous iteration's trailer load, avoiding a separate
-        // memory load per tag.
-        let mut preload = *src.add(self.s) as u32;
+        // Use raw pointers for the hot loop to avoid base+offset additions.
+        let mut ip = src.add(self.s);
+        let mut op = dst_base.add(self.d);
+        let ip_limit = src.add(src_len - 17);
+        let op_limit = dst_base.add(dst_len - 88);
+
+        let mut preload = *ip as u32;
 
         loop {
+            // Hint to the compiler that preload is already zero-extended,
+            // avoiding a redundant AND instruction on aarch64 (LLVM bug 51317).
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("", in(reg) preload, options(nomem, nostack, preserves_flags));
+
             let byte = preload as u8;
 
             if byte & 3 == 0 {
                 let len = (byte >> 2) as usize + 1;
+                ip = ip.add(1);
                 if len <= 16 {
-                    self.s += 1;
-                    ptr::copy_nonoverlapping(
-                        src.add(self.s),
-                        dst.add(self.d),
-                        16,
-                    );
-                    self.s += len;
-                    self.d += len;
-                } else if len <= 60 && self.s + 1 + len + 16 <= src_len {
-                    self.s += 1;
-                    wide_copy(src.add(self.s), dst.add(self.d), len);
-                    self.s += len;
-                    self.d += len;
+                    ptr::copy_nonoverlapping(ip, op, 16);
+                    ip = ip.add(len);
+                    op = op.add(len);
+                } else if len <= 60
+                    && (ip as usize + len + 16) <= (src.add(src_len) as usize)
+                {
+                    wide_copy(ip, op, len);
+                    ip = ip.add(len);
+                    op = op.add(len);
                 } else {
-                    self.s += 1;
+                    // Fall back to index-based slow path.
+                    self.s = ip.offset_from(src) as usize;
+                    self.d = op.offset_from(dst_base) as usize;
                     self.read_literal(len)?;
+                    ip = src.add(self.s);
+                    op = dst_base.add(self.d);
                 }
-                // Literals: can't preload, must reload next tag.
-                if !(self.s <= src_limit && self.d <= dst_limit) {
+                if !(ip <= ip_limit && op <= op_limit) {
                     break;
                 }
-                preload = *src.add(self.s) as u32;
+                preload = *ip as u32;
                 continue;
             }
 
@@ -259,16 +264,20 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let tag_type = (byte & 3) as usize;
             let num_tag_bytes = tag_type + (tag_type == 3) as usize;
             let len = entry_val & 0xFF;
-            self.s += 1;
+            ip = ip.add(1);
 
-            // Load 4 bytes: trailer data + (for Copy1/Copy2) next tag byte.
-            let loaded = bytes::loadu_u32_le(src.add(self.s));
+            let loaded = bytes::loadu_u32_le(ip);
             let extracted =
                 (loaded & extract_offset_mask(tag_type)) as usize;
             let offset = (entry_val & 0x700) | extracted;
-            self.s += num_tag_bytes;
+            ip = ip.add(num_tag_bytes);
 
-            if self.d <= offset.wrapping_sub(1) {
+            // Check: op - offset >= dst_base (i.e. copy source is valid).
+            if (op as usize).wrapping_sub(offset) < dst_base as usize
+                || offset == 0
+            {
+                self.s = ip.offset_from(src) as usize;
+                self.d = op.offset_from(dst_base) as usize;
                 return Err(Error::Offset {
                     offset: offset as u64,
                     dst_pos: self.d as u64,
@@ -276,35 +285,32 @@ impl<'s, 'd> Decompress<'s, 'd> {
             }
 
             if len <= 16 && offset >= 8 {
-                let dstp = dst.add(self.d);
-                let srcp = dstp.sub(offset);
-                ptr::copy_nonoverlapping(srcp, dstp, 8);
-                ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
-                self.d += len;
+                let srcp = op.sub(offset);
+                ptr::copy_nonoverlapping(srcp, op, 8);
+                ptr::copy_nonoverlapping(srcp.add(8), op.add(8), 8);
+                op = op.add(len);
             } else if offset >= 16 {
-                let dstp = dst.add(self.d);
-                wide_copy(dstp.sub(offset), dstp, len);
-                self.d += len;
+                wide_copy(op.sub(offset), op, len);
+                op = op.add(len);
             } else {
-                overlapping_copy(dst.add(self.d), offset, len);
-                self.d += len;
+                overlapping_copy(op, offset, len);
+                op = op.add(len);
             }
 
-            // Preload trick: extract next tag byte from the already-loaded
-            // u32 trailer. For Copy1/Copy2, shift by tag_type*8 bits.
             preload = loaded >> (tag_type as u32 * 8);
             if tag_type == 3 {
-                // Copy4: next tag byte not in our 4-byte load, reload.
-                if !(self.s <= src_limit && self.d <= dst_limit) {
+                if !(ip <= ip_limit && op <= op_limit) {
                     break;
                 }
-                preload = *src.add(self.s) as u32;
+                preload = *ip as u32;
             }
 
-            if !(self.s <= src_limit && self.d <= dst_limit) {
+            if !(ip <= ip_limit && op <= op_limit) {
                 break;
             }
         }
+        self.s = ip.offset_from(src) as usize;
+        self.d = op.offset_from(dst_base) as usize;
         Ok(())
     }
 
