@@ -9,6 +9,22 @@ use crate::MAX_INPUT_SIZE;
 /// tag byte.
 const TAG_LOOKUP_TABLE: TagLookupTable = TagLookupTable(tag::TAG_LOOKUP_TABLE);
 
+/// Copy up to 64 bytes using unrolled 16-byte copies.
+/// `src` and `dst` must not overlap and must have at least `len + 16` bytes
+/// of addressable memory (we always copy in 16-byte chunks).
+#[inline(always)]
+unsafe fn wide_copy(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len <= 64);
+    ptr::copy_nonoverlapping(src, dst, 16);
+    ptr::copy_nonoverlapping(src.add(16), dst.add(16), 16);
+    if len > 32 {
+        ptr::copy_nonoverlapping(src.add(32), dst.add(32), 16);
+        if len > 48 {
+            ptr::copy_nonoverlapping(src.add(48), dst.add(48), 16);
+        }
+    }
+}
+
 /// Returns the decompressed size (in bytes) of the compressed bytes given.
 ///
 /// `input` must be a sequence of bytes returned by a conforming Snappy
@@ -121,14 +137,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// This assumes that the header has already been read and that `dst` is
     /// big enough to store all decompressed bytes.
     fn decompress(&mut self) -> Result<()> {
-        // Fast loop using raw pointers to minimize per-tag overhead.
-        // We stay in this loop as long as there's enough headroom in both
-        // src and dst for the worst-case fast-path tag (1 tag + 4 trailer
-        // + 16 data = 21 src bytes, 16 dst bytes).
         unsafe {
             self.decompress_fast()?;
         }
-        // Slow loop for the remaining bytes near the end of the buffers.
         while self.s < self.src.len() {
             let byte = self.src[self.s];
             self.s += 1;
@@ -148,11 +159,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
         Ok(())
     }
 
-    /// Fast decompression loop using raw pointers.
-    ///
-    /// Handles common fast-path tags (small literals, copies with
-    /// offset >= 8 and len <= 16) with raw pointer ops. Delegates
-    /// complex cases to the existing safe methods and continues.
+    /// Fast decompression loop using raw pointers for common cases.
     #[inline(always)]
     unsafe fn decompress_fast(&mut self) -> Result<()> {
         let src = self.src.as_ptr();
@@ -164,7 +171,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let byte = *src.add(self.s);
 
             if byte & 3 == 0 {
-                // Literal tag
                 let len = (byte >> 2) as usize + 1;
                 if len <= 16
                     && self.s + 1 + 16 <= src_len
@@ -180,48 +186,26 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     self.d += len;
                     continue;
                 }
-                // Medium-fast path for literals with len 17-60:
-                // unrolled 16-byte copies, avoiding the overhead of
-                // read_literal's bounds checks and extended-length handling.
+                // Medium-fast path for literals len 17-60.
                 if len <= 60
                     && self.s + 1 + len + 16 <= src_len
                     && self.d + len + 16 <= dst_len
                 {
                     self.s += 1;
-                    let srcp = src.add(self.s);
-                    let dstp = dst.add(self.d);
-                    ptr::copy_nonoverlapping(srcp, dstp, 16);
-                    ptr::copy_nonoverlapping(srcp.add(16), dstp.add(16), 16);
-                    if len > 32 {
-                        ptr::copy_nonoverlapping(
-                            srcp.add(32),
-                            dstp.add(32),
-                            16,
-                        );
-                        if len > 48 {
-                            ptr::copy_nonoverlapping(
-                                srcp.add(48),
-                                dstp.add(48),
-                                16,
-                            );
-                        }
-                    }
+                    wide_copy(src.add(self.s), dst.add(self.d), len);
                     self.s += len;
                     self.d += len;
                     continue;
                 }
-                // Slow path: extended literals or near boundaries
                 self.s += 1;
                 self.read_literal(len)?;
                 continue;
             }
 
-            // Copy tag: fast-path offset/len computation
             let entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
             let tag_type = (byte & 3) as usize;
             let num_tag_bytes = tag_type + (tag_type == 3) as usize;
             let len = entry_val & 0xFF;
-            // Save position before consuming tag, for potential backup
             let s_tag = self.s;
             self.s += 1;
 
@@ -248,38 +232,19 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     continue;
                 }
 
-                // Fast path for medium copies (len 17-64, offset >= 16).
-                // Two 16-byte non-overlapping copies handle up to 32 bytes.
-                // Four handle up to 64 (max copy-2 length).
+                // Medium copies (len 17-64, offset >= 16): no overlap.
                 if offset >= 16 && self.d + len + 16 <= dst_len {
                     let dstp = dst.add(self.d);
-                    let srcp = dstp.sub(offset);
-                    ptr::copy_nonoverlapping(srcp, dstp, 16);
-                    ptr::copy_nonoverlapping(srcp.add(16), dstp.add(16), 16);
-                    if len > 32 {
-                        ptr::copy_nonoverlapping(
-                            srcp.add(32),
-                            dstp.add(32),
-                            16,
-                        );
-                        if len > 48 {
-                            ptr::copy_nonoverlapping(
-                                srcp.add(48),
-                                dstp.add(48),
-                                16,
-                            );
-                        }
-                    }
+                    wide_copy(dstp.sub(offset), dstp, len);
                     self.d += len;
                     continue;
                 }
 
-                // Medium path: long copies with offset >= 8
+                // Long copies with offset >= 8
                 let end = self.d + len;
                 if offset >= 8 && end + 24 <= dst_len {
                     let mut dstp = dst.add(self.d);
                     let mut srcp = dstp.sub(offset);
-                    // Expand overlap until gap >= 16
                     loop {
                         let diff = (dstp as usize) - (srcp as usize);
                         if diff >= 16 {
@@ -289,7 +254,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         self.d += diff;
                         dstp = dstp.add(diff);
                     }
-                    // Non-overlapping 16-byte copies
                     while self.d < end {
                         ptr::copy_nonoverlapping(srcp, dstp, 16);
                         srcp = srcp.add(16);
@@ -301,7 +265,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 }
             }
 
-            // Slow path: restore s to just past tag byte, delegate
             self.s = s_tag + 1;
             self.read_copy(byte)?;
         }
@@ -396,12 +359,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
         // Find the copy offset and len, then advance the input past the copy.
         // The rest of this function deals with reading/writing to output only.
         let entry = TAG_LOOKUP_TABLE.entry(tag_byte);
-        // Compute num_tag_bytes from tag_type directly (1→1, 2→2, 3→4)
-        // instead of from entry.num_tag_bytes(). This is available as soon
-        // as the tag byte is loaded, breaking the serial dependency:
-        // tag → table_load → extract_num_tag_bytes → compute_mask.
+        // Compute num_tag_bytes from tag_type directly to break serial
+        // dependency through the table entry.
         let tag_type = (tag_byte & 3) as usize;
-        // tag_type: 1→1, 2→2, 3→4 trailing bytes
         let num_tag_bytes = tag_type + (tag_type == 3) as usize;
         let offset = entry.offset_with_ntb(self.src, self.s, num_tag_bytes)?;
         let len = entry.len();
@@ -432,19 +392,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
         } else if offset >= 16 && end + 16 <= self.dst.len() {
             unsafe {
                 let dstp = self.dst.as_mut_ptr().add(self.d);
-                let srcp = dstp.sub(offset);
-                ptr::copy_nonoverlapping(srcp, dstp, 16);
-                ptr::copy_nonoverlapping(srcp.add(16), dstp.add(16), 16);
-                if len > 32 {
-                    ptr::copy_nonoverlapping(srcp.add(32), dstp.add(32), 16);
-                    if len > 48 {
-                        ptr::copy_nonoverlapping(
-                            srcp.add(48),
-                            dstp.add(48),
-                            16,
-                        );
-                    }
-                }
+                wide_copy(dstp.sub(offset), dstp, len);
             }
         // If we have some wiggle room, try to decompress the copy 16 bytes
         // at a time with 128 bit unaligned loads/stores. Remember, we can't
@@ -600,9 +548,6 @@ impl TagEntry {
     ///
     /// This requires reading from the compressed input since the offset is
     /// encoded in bytes proceding the tag byte.
-    ///
-    /// `num_tag_bytes` is passed in directly (computed from `tag & 3`)
-    /// to break the serial dependency through the table entry.
     fn offset_with_ntb(
         &self,
         src: &[u8],
@@ -618,10 +563,6 @@ impl TagEntry {
                     // SAFETY: The conditional above guarantees that
                     // src[s..s+4] is valid to read from.
                     let p = src.as_ptr().add(s);
-                    // Mask to extract only the bytes we need from the u32.
-                    // num_tag_bytes is 1, 2, or 4 for copy tags, so the
-                    // shift is always 24, 16, or 0 (all < 32).
-                    // This avoids a table lookup on the critical path.
                     let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
                     bytes::loadu_u32_le(p) as usize & mask as usize
                 }
