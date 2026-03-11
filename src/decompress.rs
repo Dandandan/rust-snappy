@@ -222,6 +222,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let mut op = dst_base.add(self.d);
         let ip_limit = src.add(src_len - 17);
         let op_limit = dst_base.add(dst_len - 88);
+        let src_end = src.add(src_len);
+        let dst_base_addr = dst_base as usize;
 
         let mut preload = *ip as u32;
 
@@ -244,7 +246,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 let offset = (entry_val & 0x700) | extracted;
                 ip = ip.add(num_tag_bytes);
 
-                if (op as usize).wrapping_sub(offset) < dst_base as usize
+                if (op as usize).wrapping_sub(offset) < dst_base_addr
                     || offset == 0
                 {
                     self.s = ip.offset_from(src) as usize;
@@ -280,7 +282,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     op = op.add(len);
                 } else if len <= 60
                     && (ip as usize + len + 16)
-                        <= (src.add(src_len) as usize)
+                        <= (src_end as usize)
                 {
                     wide_copy(ip, op, len);
                     ip = ip.add(len);
