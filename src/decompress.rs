@@ -121,6 +121,14 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// This assumes that the header has already been read and that `dst` is
     /// big enough to store all decompressed bytes.
     fn decompress(&mut self) -> Result<()> {
+        // Fast loop using raw pointers to minimize per-tag overhead.
+        // We stay in this loop as long as there's enough headroom in both
+        // src and dst for the worst-case fast-path tag (1 tag + 4 trailer
+        // + 16 data = 21 src bytes, 16 dst bytes).
+        unsafe {
+            self.decompress_fast()?;
+        }
+        // Slow loop for the remaining bytes near the end of the buffers.
         while self.s < self.src.len() {
             let byte = self.src[self.s];
             self.s += 1;
@@ -136,6 +144,94 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 expected_len: self.dst.len() as u64,
                 got_len: self.d as u64,
             });
+        }
+        Ok(())
+    }
+
+    /// Fast decompression loop using raw pointers.
+    ///
+    /// Handles common cases (small literals, copies with offset >= 8 and
+    /// len <= 16) with minimal per-tag overhead. For uncommon cases, calls
+    /// the original methods and continues the fast loop.
+    #[inline(always)]
+    unsafe fn decompress_fast(&mut self) -> Result<()> {
+        let src = self.src.as_ptr();
+        let dst = self.dst.as_mut_ptr();
+        let src_len = self.src.len();
+        let dst_len = self.dst.len();
+
+        while self.s + 5 <= src_len {
+            let byte = *src.add(self.s);
+
+            if byte & 3 == 0 {
+                // Literal tag
+                let len = (byte >> 2) as usize + 1;
+                if len <= 16
+                    && self.s + 1 + 16 <= src_len
+                    && self.d + 16 <= dst_len
+                {
+                    self.s += 1;
+                    ptr::copy_nonoverlapping(
+                        src.add(self.s),
+                        dst.add(self.d),
+                        16,
+                    );
+                    self.s += len;
+                    self.d += len;
+                    continue;
+                }
+                // Slow path for extended literals or near boundaries
+                self.s += 1;
+                self.read_literal(len)?;
+                continue;
+            }
+
+            // Copy tag: compute offset/len using raw pointers
+            let entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
+            let tag_type = (byte & 3) as usize;
+            let num_tag_bytes = tag_type + (tag_type == 3) as usize;
+            let len = entry_val & 0xFF;
+            self.s += 1;
+
+            // Check we can read the trailer
+            if self.s + 4 > src_len {
+                // Near end, fall back to safe read_copy
+                self.s -= 1;
+                self.s += 1;
+                self.read_copy(byte)?;
+                continue;
+            }
+
+            // Fast trailer load
+            let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
+            let trailer =
+                bytes::loadu_u32_le(src.add(self.s)) as usize & mask as usize;
+            let offset = (entry_val & 0x700) | trailer;
+            self.s += num_tag_bytes;
+
+            // Validate offset
+            if self.d <= offset.wrapping_sub(1) {
+                return Err(Error::Offset {
+                    offset: offset as u64,
+                    dst_pos: self.d as u64,
+                });
+            }
+
+            if offset >= 8 && len <= 16 && self.d + 16 <= dst_len {
+                // Fast copy: two non-overlapping 8-byte copies
+                let dstp = dst.add(self.d);
+                let srcp = dstp.sub(offset);
+                ptr::copy_nonoverlapping(srcp, dstp, 8);
+                ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
+                self.d += len;
+                continue;
+            }
+
+            // Slow path for complex copies (small offset, large len,
+            // or near dst boundary). Reconstruct state for read_copy.
+            self.s -= num_tag_bytes + 1;
+            self.s += 1;
+            self.read_copy(byte)?;
         }
         Ok(())
     }
