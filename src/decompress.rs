@@ -183,99 +183,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// This assumes that the header has already been read and that `dst` is
     /// big enough to store all decompressed bytes.
     fn decompress(&mut self) -> Result<()> {
-        let src_len = self.src.len();
-        let dst_len = self.dst.len();
-
-        // Fast unified loop: processes short literals and copies through
-        // a single code path using the LENGTH_MINUS_OFFSET table.
-        // The key insight (from C++ snappy): by encoding literal entries
-        // as `length - 256`, both literals and copies satisfy
-        // `entry <= extracted` in the common case, eliminating the need
-        // to branch on tag type for most of the processing.
-        'outer: loop {
-            // Headroom: need 2 bytes for u16 trailing load, plus up to
-            // 16 bytes for literal source data.
-            while self.s + 18 <= src_len && self.d + 16 <= dst_len {
-                // SAFETY: headroom check guarantees src[s], src[s+1..s+2]
-                // (for u16 load), and dst[d..d+16] are in bounds.
-                unsafe {
-                    let tag = *self.src.get_unchecked(self.s);
-                    let tag_type = (tag & 3) as usize;
-                    let entry = *LENGTH_MINUS_OFFSET.get_unchecked(tag as usize);
-
-                    let old_s = self.s + 1;
-                    let next = u16::from_le(
-                        (self.src.as_ptr().add(old_s) as *const u16)
-                            .read_unaligned(),
-                    ) as u32;
-
-                    let len = (entry & 0xFF) as usize;
-                    if len > 16 {
-                        break;
-                    }
-                    let extracted = extract_offset(next, tag_type) as i16;
-
-                    // Catches: pattern-extension copies (offset < len),
-                    // long literals/copies, extended literals, copy-4.
-                    if entry > extracted {
-                        break;
-                    }
-
-                    // For copies: len_min_offset = len - full_offset
-                    // For literals: len_min_offset = len - 256
-                    let len_min_offset = (entry - extracted) as isize;
-                    let full_offset =
-                        (len as isize - len_min_offset) as usize;
-
-                    // Validate copy offset: need offset <= d AND offset >= 8
-                    // (offset < 8 requires pattern-extension handling).
-                    // For literals tag_type == 0, so this is skipped.
-                    if tag_type != 0
-                        && (full_offset < 8 || full_offset > self.d)
-                    {
-                        break;
-                    }
-
-                    // delta = d - full_offset (copy source position)
-                    // For literals: d - 256 (garbage, but masked away)
-                    let delta = self.d.wrapping_sub(full_offset);
-
-                    // Branchless source pointer selection via bitmask
-                    let tag_mask =
-                        0usize.wrapping_sub((tag_type != 0) as usize);
-                    let copy_src =
-                        (self.dst.as_ptr() as usize).wrapping_add(delta);
-                    let lit_src =
-                        self.src.as_ptr() as usize + old_s;
-                    let from = ((copy_src & tag_mask)
-                        | (lit_src & !tag_mask))
-                        as *const u8;
-
-                    let dstp = self.dst.as_mut_ptr().add(self.d);
-                    ptr::copy_nonoverlapping(from, dstp, 8);
-                    ptr::copy_nonoverlapping(
-                        from.add(8),
-                        dstp.add(8),
-                        8,
-                    );
-
-                    // Advance input: literal skips len data bytes,
-                    // copy skips tag_type trailing bytes.
-                    // This branch is the only tag-type-dependent operation
-                    // AFTER the memory copy, minimizing misprediction cost.
-                    if tag_type == 0 {
-                        self.s = old_s + len;
-                    } else {
-                        self.s = old_s + tag_type;
-                    }
-                    self.d += len;
-                }
-            }
-
-            // Slow path: handle one tag, then re-enter the fast loop.
-            if self.s >= src_len {
-                break 'outer;
-            }
+        while self.s < self.src.len() {
             let byte = self.src[self.s];
             self.s += 1;
             if byte & 0b000000_11 == 0 {
@@ -285,9 +193,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 self.read_copy(byte)?;
             }
         }
-        if self.d != dst_len {
+        if self.d != self.dst.len() {
             return Err(Error::HeaderMismatch {
-                expected_len: dst_len as u64,
+                expected_len: self.dst.len() as u64,
                 got_len: self.d as u64,
             });
         }
