@@ -200,14 +200,20 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let src_len = self.src.len();
         let dst_len = self.dst.len();
 
-        while self.s + 17 <= src_len && self.d + 88 <= dst_len {
-            let byte = *src.add(self.s);
+        if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
+            return Ok(());
+        }
 
+        // Software-pipelined loop: pre-load the current tag byte and its
+        // table entry so that after each copy/literal the next iteration's
+        // loads are already in flight.
+        let mut byte = *src.add(self.s);
+        let mut entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
+
+        loop {
             if byte & 3 == 0 {
                 let len = (byte >> 2) as usize + 1;
                 if len <= 16 {
-                    // Always safe: loop condition guarantees
-                    // s + 1 + 16 <= src_len and d + 16 <= dst_len.
                     self.s += 1;
                     ptr::copy_nonoverlapping(
                         src.add(self.s),
@@ -216,31 +222,29 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     );
                     self.s += len;
                     self.d += len;
-                    continue;
-                }
-                // Medium-fast path for literals len 17-60.
-                // Destination is guaranteed safe by loop condition
-                // (d + 76 <= d + 88 <= dst_len). Source needs checking.
-                if len <= 60 && self.s + 1 + len + 16 <= src_len {
+                } else if len <= 60 && self.s + 1 + len + 16 <= src_len {
                     self.s += 1;
                     wide_copy(src.add(self.s), dst.add(self.d), len);
                     self.s += len;
                     self.d += len;
-                    continue;
+                } else {
+                    self.s += 1;
+                    self.read_literal(len)?;
                 }
-                self.s += 1;
-                self.read_literal(len)?;
+                // Re-check loop condition, then pre-load next tag.
+                if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
+                    break;
+                }
+                byte = *src.add(self.s);
+                entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
                 continue;
             }
 
-            let entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
             let tag_type = (byte & 3) as usize;
             let num_tag_bytes = tag_type + (tag_type == 3) as usize;
             let len = entry_val & 0xFF;
             self.s += 1;
 
-            // Safety: loop condition guarantees s + 17 <= src_len,
-            // so after s += 1 there are at least 16 >= 4 bytes available.
             let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
             let trailer = bytes::loadu_u32_le(src.add(self.s)) as usize
                 & mask as usize;
@@ -254,35 +258,39 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 });
             }
 
+            // Pre-load next tag byte and table entry BEFORE the copy,
+            // so the ~4-cycle table lookup overlaps with the copy operation.
+            // Safety: self.s is valid (we'll re-check the loop condition
+            // after the copy, but reading one byte past the end is safe
+            // because src_len >= s + 17 held at loop entry and we advanced
+            // at most 5 bytes).
+            byte = *src.add(self.s);
+            entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
+
             // All destination bounds are guaranteed by the loop condition
             // (d + 88 <= dst_len covers max copy 64 + 24 wiggle room).
             if len <= 16 && offset >= 16 {
-                // Single 128-bit non-overlapping copy (compiles to ldr q/str q).
                 let dstp = dst.add(self.d);
                 ptr::copy_nonoverlapping(dstp.sub(offset), dstp, 16);
                 self.d += len;
-                continue;
-            }
-
-            if offset >= 8 && len <= 16 {
-                // For offset 8-15: two 64-bit copies to avoid UB from overlap.
+            } else if offset >= 8 && len <= 16 {
                 let dstp = dst.add(self.d);
                 let srcp = dstp.sub(offset);
                 ptr::copy_nonoverlapping(srcp, dstp, 8);
                 ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
                 self.d += len;
-                continue;
-            }
-
-            if offset >= 16 {
+            } else if offset >= 16 {
                 let dstp = dst.add(self.d);
                 wide_copy(dstp.sub(offset), dstp, len);
                 self.d += len;
-                continue;
+            } else {
+                overlapping_copy(dst.add(self.d), offset, len);
+                self.d += len;
             }
 
-            overlapping_copy(dst.add(self.d), offset, len);
-            self.d += len;
+            if !(self.s + 17 <= src_len && self.d + 88 <= dst_len) {
+                break;
+            }
         }
         Ok(())
     }
@@ -375,8 +383,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
         // Find the copy offset and len, then advance the input past the copy.
         // The rest of this function deals with reading/writing to output only.
         let entry = TAG_LOOKUP_TABLE.entry(tag_byte);
-        // Compute num_tag_bytes from tag_type directly to break serial
-        // dependency through the table entry.
         let tag_type = (tag_byte & 3) as usize;
         let num_tag_bytes = tag_type + (tag_type == 3) as usize;
         let offset = entry.offset_with_ntb(self.src, self.s, num_tag_bytes)?;
@@ -503,6 +509,7 @@ impl TagLookupTable {
     }
 }
 
+
 /// Represents a single entry in the tag lookup table.
 ///
 /// See the documentation in `TagLookupTable` for the bit layout.
@@ -515,6 +522,7 @@ impl TagEntry {
     fn len(&self) -> usize {
         self.0 & 0xFF
     }
+
 
     /// Return the copy offset corresponding to this copy operation. `s` should
     /// point to the position just after the tag byte that this entry was read
