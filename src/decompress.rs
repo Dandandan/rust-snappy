@@ -227,10 +227,10 @@ impl<'s, 'd> Decompress<'s, 'd> {
 
         loop {
             let byte = preload as u8;
+            // Track whether we need to reload preload from memory
+            // (literals always, Copy4 always, Copy1/Copy2 never).
+            let mut reload = true;
 
-            // Copy path first — uses `continue` to branch back.
-            // Literal path last — falls through to loop back-edge,
-            // saving one unconditional branch (PGO-informed layout).
             if byte & 3 != 0 {
                 let entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
                 let tag_type = (byte & 3) as usize;
@@ -268,45 +268,39 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     op = op.add(len);
                 }
 
+                // Preload next tag from the trailer for Copy1/Copy2.
                 preload = loaded >> (tag_type as u32 * 8);
-                if tag_type == 3 {
-                    if !(ip <= ip_limit && op <= op_limit) {
-                        break;
-                    }
-                    preload = *ip as u32;
-                }
-
-                if !(ip <= ip_limit && op <= op_limit) {
-                    break;
-                }
-                continue;
-            }
-
-            // Literal path — at end of loop body so preload falls
-            // through to loop back-edge without an extra branch.
-            let len = (byte >> 2) as usize + 1;
-            ip = ip.add(1);
-            if len <= 16 {
-                ptr::copy_nonoverlapping(ip, op, 16);
-                ip = ip.add(len);
-                op = op.add(len);
-            } else if len <= 60
-                && (ip as usize + len + 16) <= (src.add(src_len) as usize)
-            {
-                wide_copy(ip, op, len);
-                ip = ip.add(len);
-                op = op.add(len);
+                reload = tag_type == 3;
             } else {
-                self.s = ip.offset_from(src) as usize;
-                self.d = op.offset_from(dst_base) as usize;
-                self.read_literal(len)?;
-                ip = src.add(self.s);
-                op = dst_base.add(self.d);
+                let len = (byte >> 2) as usize + 1;
+                ip = ip.add(1);
+                if len <= 16 {
+                    ptr::copy_nonoverlapping(ip, op, 16);
+                    ip = ip.add(len);
+                    op = op.add(len);
+                } else if len <= 60
+                    && (ip as usize + len + 16)
+                        <= (src.add(src_len) as usize)
+                {
+                    wide_copy(ip, op, len);
+                    ip = ip.add(len);
+                    op = op.add(len);
+                } else {
+                    self.s = ip.offset_from(src) as usize;
+                    self.d = op.offset_from(dst_base) as usize;
+                    self.read_literal(len)?;
+                    ip = src.add(self.s);
+                    op = dst_base.add(self.d);
+                }
             }
+
+            // Single unified bounds check and preload for all paths.
             if !(ip <= ip_limit && op <= op_limit) {
                 break;
             }
-            preload = *ip as u32;
+            if reload {
+                preload = *ip as u32;
+            }
         }
         self.s = ip.offset_from(src) as usize;
         self.d = op.offset_from(dst_base) as usize;
