@@ -9,6 +9,7 @@ use crate::MAX_INPUT_SIZE;
 /// tag byte.
 const TAG_LOOKUP_TABLE: TagLookupTable = TagLookupTable(tag::TAG_LOOKUP_TABLE);
 
+
 /// Copy up to 64 bytes using unrolled 16-byte copies.
 /// `src` and `dst` must not overlap and must have at least `len + 16` bytes
 /// of addressable memory (we always copy in 16-byte chunks).
@@ -227,82 +228,85 @@ impl<'s, 'd> Decompress<'s, 'd> {
         loop {
             let byte = preload as u8;
 
-            if byte & 3 == 0 {
-                let len = (byte >> 2) as usize + 1;
+            // Copy path first — uses `continue` to branch back.
+            // Literal path last — falls through to loop back-edge,
+            // saving one unconditional branch (PGO-informed layout).
+            if byte & 3 != 0 {
+                let entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
+                let tag_type = (byte & 3) as usize;
+                let num_tag_bytes = tag_type + (tag_type == 3) as usize;
+                let len = entry_val & 0xFF;
                 ip = ip.add(1);
-                if len <= 16 {
-                    ptr::copy_nonoverlapping(ip, op, 16);
-                    ip = ip.add(len);
-                    op = op.add(len);
-                } else if len <= 60
-                    && (ip as usize + len + 16) <= (src.add(src_len) as usize)
+
+                let loaded = bytes::loadu_u32_le(ip);
+                let extracted =
+                    (loaded & extract_offset_mask(tag_type)) as usize;
+                let offset = (entry_val & 0x700) | extracted;
+                ip = ip.add(num_tag_bytes);
+
+                if (op as usize).wrapping_sub(offset) < dst_base as usize
+                    || offset == 0
                 {
-                    wide_copy(ip, op, len);
-                    ip = ip.add(len);
-                    op = op.add(len);
-                } else {
-                    // Fall back to index-based slow path.
                     self.s = ip.offset_from(src) as usize;
                     self.d = op.offset_from(dst_base) as usize;
-                    self.read_literal(len)?;
-                    ip = src.add(self.s);
-                    op = dst_base.add(self.d);
+                    return Err(Error::Offset {
+                        offset: offset as u64,
+                        dst_pos: self.d as u64,
+                    });
                 }
+
+                if len <= 16 && offset >= 8 {
+                    let srcp = op.sub(offset);
+                    ptr::copy_nonoverlapping(srcp, op, 8);
+                    ptr::copy_nonoverlapping(srcp.add(8), op.add(8), 8);
+                    op = op.add(len);
+                } else if offset >= 16 {
+                    wide_copy(op.sub(offset), op, len);
+                    op = op.add(len);
+                } else {
+                    overlapping_copy(op, offset, len);
+                    op = op.add(len);
+                }
+
+                preload = loaded >> (tag_type as u32 * 8);
+                if tag_type == 3 {
+                    if !(ip <= ip_limit && op <= op_limit) {
+                        break;
+                    }
+                    preload = *ip as u32;
+                }
+
                 if !(ip <= ip_limit && op <= op_limit) {
                     break;
                 }
-                preload = *ip as u32;
                 continue;
             }
 
-            let entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
-            let tag_type = (byte & 3) as usize;
-            let num_tag_bytes = tag_type + (tag_type == 3) as usize;
-            let len = entry_val & 0xFF;
+            // Literal path — at end of loop body so preload falls
+            // through to loop back-edge without an extra branch.
+            let len = (byte >> 2) as usize + 1;
             ip = ip.add(1);
-
-            let loaded = bytes::loadu_u32_le(ip);
-            let extracted =
-                (loaded & extract_offset_mask(tag_type)) as usize;
-            let offset = (entry_val & 0x700) | extracted;
-            ip = ip.add(num_tag_bytes);
-
-            // Check: op - offset >= dst_base (i.e. copy source is valid).
-            if (op as usize).wrapping_sub(offset) < dst_base as usize
-                || offset == 0
-            {
-                self.s = ip.offset_from(src) as usize;
-                self.d = op.offset_from(dst_base) as usize;
-                return Err(Error::Offset {
-                    offset: offset as u64,
-                    dst_pos: self.d as u64,
-                });
-            }
-
-            if len <= 16 && offset >= 8 {
-                let srcp = op.sub(offset);
-                ptr::copy_nonoverlapping(srcp, op, 8);
-                ptr::copy_nonoverlapping(srcp.add(8), op.add(8), 8);
+            if len <= 16 {
+                ptr::copy_nonoverlapping(ip, op, 16);
+                ip = ip.add(len);
                 op = op.add(len);
-            } else if offset >= 16 {
-                wide_copy(op.sub(offset), op, len);
+            } else if len <= 60
+                && (ip as usize + len + 16) <= (src.add(src_len) as usize)
+            {
+                wide_copy(ip, op, len);
+                ip = ip.add(len);
                 op = op.add(len);
             } else {
-                overlapping_copy(op, offset, len);
-                op = op.add(len);
+                self.s = ip.offset_from(src) as usize;
+                self.d = op.offset_from(dst_base) as usize;
+                self.read_literal(len)?;
+                ip = src.add(self.s);
+                op = dst_base.add(self.d);
             }
-
-            preload = loaded >> (tag_type as u32 * 8);
-            if tag_type == 3 {
-                if !(ip <= ip_limit && op <= op_limit) {
-                    break;
-                }
-                preload = *ip as u32;
-            }
-
             if !(ip <= ip_limit && op <= op_limit) {
                 break;
             }
+            preload = *ip as u32;
         }
         self.s = ip.offset_from(src) as usize;
         self.d = op.offset_from(dst_base) as usize;
