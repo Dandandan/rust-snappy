@@ -468,7 +468,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         d += len;
                     }
                 } else if len <= 60
-                    && (ip as usize + len + 16) <= (src_end as usize)
+                    && (ip as usize + 64) <= (src_end as usize)
                 {
                     wide_copy_long(ip, op, len);
                     ip = ip.add(len);
