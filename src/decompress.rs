@@ -6,9 +6,8 @@ use crate::tag;
 use crate::MAX_INPUT_SIZE;
 
 /// A lookup table for quickly computing the various attributes derived from a
-/// tag byte.
-const TAG_LOOKUP_TABLE: TagLookupTable = TagLookupTable(tag::TAG_LOOKUP_TABLE);
-
+/// tag byte. See the comment above `TagLookupTable` for the bit layout.
+const TAG_LOOKUP_TABLE: [u16; 256] = tag::TAG_LOOKUP_TABLE;
 
 /// Copy up to 64 bytes using unrolled 16-byte copies.
 /// `src` and `dst` must not overlap in each 16-byte chunk.
@@ -37,7 +36,6 @@ unsafe fn wide_copy_long(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
-
 /// Extract the offset mask for a given tag_type (1, 2, or 3).
 /// Returns a mask: tag_type=1 → 0xFF, tag_type=2 → 0xFFFF, tag_type=3 → 0.
 ///
@@ -54,6 +52,28 @@ fn extract_offset_mask(tag_type: usize) -> u32 {
     {
         const MASKS: [u32; 4] = [0, 0xFF, 0xFFFF, 0];
         MASKS[tag_type]
+    }
+}
+
+/// Dispatch a copy of `len` bytes from `dst - offset` to `dst`.
+///
+/// Tries fast wide-copy paths (non-overlapping 8/16/32 byte chunks).
+/// Falls back to `overlapping_copy` when offset < 16.
+///
+/// Caller must ensure at least `len + 24` bytes of writable space at `dst`
+/// and at least `offset` valid bytes preceding `dst`.
+#[inline(always)]
+unsafe fn copy_dispatch(dst: *mut u8, offset: usize, len: usize) {
+    let srcp = dst.sub(offset);
+    if len <= 16 && offset >= 8 {
+        ptr::copy_nonoverlapping(srcp, dst, 8);
+        ptr::copy_nonoverlapping(srcp.add(8), dst.add(8), 8);
+    } else if offset >= 32 {
+        wide_copy_long(srcp, dst, len);
+    } else if offset >= 16 {
+        wide_copy(srcp, dst, len);
+    } else {
+        overlapping_copy(dst, offset, len);
     }
 }
 
@@ -255,7 +275,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let mut reload = true;
 
             if byte & 3 != 0 {
-                let entry_val = TAG_LOOKUP_TABLE.0[byte as usize] as usize;
+                let entry_val = TAG_LOOKUP_TABLE[byte as usize] as usize;
                 let tag_type = (byte & 3) as usize;
                 let num_tag_bytes = tag_type + (tag_type == 3) as usize;
                 let len = entry_val & 0xFF;
@@ -278,22 +298,12 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     });
                 }
 
-                if len <= 16 && offset >= 8 {
-                    ptr::copy_nonoverlapping(srcp, op, 8);
-                    ptr::copy_nonoverlapping(srcp.add(8), op.add(8), 8);
-                    op = op.add(len);
-                } else if offset >= 32 {
-                    wide_copy_long(srcp, op, len);
-                    op = op.add(len);
-                } else if offset >= 16 {
-                    wide_copy(srcp, op, len);
-                    op = op.add(len);
-                } else {
-                    overlapping_copy(op, offset, len);
-                    op = op.add(len);
-                }
+                copy_dispatch(op, offset, len);
+                op = op.add(len);
 
                 // Preload next tag from the trailer for Copy1/Copy2.
+                // For Copy4 (num_tag_bytes=4), shift is 32 → result is 0,
+                // but reload=true overwrites it anyway.
                 preload = loaded >> (tag_type as u32 * 8);
                 reload = tag_type == 3;
             } else {
@@ -304,8 +314,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     ip = ip.add(len);
                     op = op.add(len);
                 } else if len <= 60
-                    && (ip as usize + len + 16)
-                        <= (src_end as usize)
+                    && (ip as usize + len + 16) <= (src_end as usize)
                 {
                     wide_copy_long(ip, op, len);
                     ip = ip.add(len);
@@ -417,13 +426,41 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// should point to the byte immediately proceding the copy tag byte.
     #[inline(always)]
     fn read_copy(&mut self, tag_byte: u8) -> Result<()> {
-        // Find the copy offset and len, then advance the input past the copy.
-        // The rest of this function deals with reading/writing to output only.
-        let entry = TAG_LOOKUP_TABLE.entry(tag_byte);
+        let entry_val = TAG_LOOKUP_TABLE[tag_byte as usize] as usize;
         let tag_type = (tag_byte & 3) as usize;
         let num_tag_bytes = tag_type + (tag_type == 3) as usize;
-        let offset = entry.offset_with_ntb(self.src, self.s, num_tag_bytes)?;
-        let len = entry.len();
+        let len = entry_val & 0xFF;
+
+        // Read offset from compressed input.
+        let trailer = if self.s + 4 <= self.src.len() {
+            unsafe {
+                let p = self.src.as_ptr().add(self.s);
+                let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
+                bytes::loadu_u32_le(p) as usize & mask as usize
+            }
+        } else if num_tag_bytes == 1 {
+            if self.s >= self.src.len() {
+                return Err(Error::CopyRead {
+                    len: 1,
+                    src_len: (self.src.len() - self.s) as u64,
+                });
+            }
+            self.src[self.s] as usize
+        } else if num_tag_bytes == 2 {
+            if self.s + 1 >= self.src.len() {
+                return Err(Error::CopyRead {
+                    len: 2,
+                    src_len: (self.src.len() - self.s) as u64,
+                });
+            }
+            bytes::read_u16_le(&self.src[self.s..]) as usize
+        } else {
+            return Err(Error::CopyRead {
+                len: num_tag_bytes as u64,
+                src_len: (self.src.len() - self.s) as u64,
+            });
+        };
+        let offset = (entry_val & 0x700) | trailer;
         self.s += num_tag_bytes;
 
         // What we really care about here is whether `d == 0` or `d < offset`.
@@ -436,34 +473,14 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 dst_pos: self.d as u64,
             });
         }
-        // When all is said and done, dst is advanced to end.
         let end = self.d + len;
-        // When the copy is small and the offset is at least 8 bytes away from
-        // `d`, then we can decompress the copy with two 64 bit unaligned
-        // loads/stores.
-        if offset >= 8 && len <= 16 && self.d + 16 <= self.dst.len() {
+        if end + 24 <= self.dst.len() {
             unsafe {
-                let dstp = self.dst.as_mut_ptr().add(self.d);
-                let srcp = dstp.sub(offset);
-                ptr::copy_nonoverlapping(srcp, dstp, 8);
-                ptr::copy_nonoverlapping(srcp.add(8), dstp.add(8), 8);
-            }
-        } else if offset >= 16 && end + 16 <= self.dst.len() {
-            unsafe {
-                let dstp = self.dst.as_mut_ptr().add(self.d);
-                wide_copy(dstp.sub(offset), dstp, len);
-            }
-        // If we have some wiggle room, try to decompress the copy 16 bytes
-        // at a time with 128 bit unaligned loads/stores. Remember, we can't
-        // just do a memcpy because decompressing copies may require copying
-        // overlapping memory.
-        //
-        // We need the extra wiggle room to make effective use of 128 bit
-        // loads/stores. Even if the store ends up copying more data than we
-        // need, we're careful to advance `d` by the correct amount at the end.
-        } else if end + 24 <= self.dst.len() {
-            unsafe {
-                overlapping_copy(self.dst.as_mut_ptr().add(self.d), offset, len);
+                copy_dispatch(
+                    self.dst.as_mut_ptr().add(self.d),
+                    offset,
+                    len,
+                );
             }
         } else {
             if end > self.dst.len() {
@@ -472,8 +489,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     dst_len: (self.dst.len() - self.d) as u64,
                 });
             }
-            // Finally, the slow byte-by-byte case, which should only be used
-            // for the last few bytes of decompression.
+            // Byte-by-byte fallback for the last few bytes.
             while self.d != end {
                 self.dst[self.d] = self.dst[self.d - offset];
                 self.d += 1;
@@ -515,98 +531,4 @@ impl Header {
     }
 }
 
-/// A lookup table for quickly computing the various attributes derived from
-/// a tag byte. The attributes are most useful for the three "copy" tags
-/// and include the length of the copy, part of the offset (for copy 1-byte
-/// only) and the total number of bytes proceding the tag byte that encode
-/// the other part of the offset (1 for copy 1, 2 for copy 2 and 4 for copy 4).
-///
-/// More specifically, the keys of the table are u8s and the values are u16s.
-/// The bits of the values are laid out as follows:
-///
-/// xxaa abbb xxcc cccc
-///
-/// Where `a` is the number of bytes, `b` are the three bits of the offset
-/// for copy 1 (the other 8 bits are in the byte proceding the tag byte; for
-/// copy 2 and copy 4, `b = 0`), and `c` is the length of the copy (max of 64).
-///
-/// We could pack this in fewer bits, but the position of the three `b` bits
-/// lines up with the most significant three bits in the total offset for copy
-/// 1, which avoids an extra shift instruction.
-///
-/// In sum, this table is useful because it reduces branches and various
-/// arithmetic operations.
-struct TagLookupTable([u16; 256]);
 
-impl TagLookupTable {
-    /// Look up the tag entry given the tag `byte`.
-    #[inline(always)]
-    fn entry(&self, byte: u8) -> TagEntry {
-        TagEntry(self.0[byte as usize] as usize)
-    }
-}
-
-
-/// Represents a single entry in the tag lookup table.
-///
-/// See the documentation in `TagLookupTable` for the bit layout.
-///
-/// The type is a `usize` for convenience.
-struct TagEntry(usize);
-
-impl TagEntry {
-    /// Return the total copy length, capped at 255.
-    fn len(&self) -> usize {
-        self.0 & 0xFF
-    }
-
-
-    /// Return the copy offset corresponding to this copy operation. `s` should
-    /// point to the position just after the tag byte that this entry was read
-    /// from.
-    ///
-    /// This requires reading from the compressed input since the offset is
-    /// encoded in bytes proceding the tag byte.
-    fn offset_with_ntb(
-        &self,
-        src: &[u8],
-        s: usize,
-        num_tag_bytes: usize,
-    ) -> Result<usize> {
-        let trailer =
-            // It is critical for this case to come first, since it is the
-            // fast path. We really hope that this case gets branch
-            // predicted.
-            if s + 4 <= src.len() {
-                unsafe {
-                    // SAFETY: The conditional above guarantees that
-                    // src[s..s+4] is valid to read from.
-                    let p = src.as_ptr().add(s);
-                    let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
-                    bytes::loadu_u32_le(p) as usize & mask as usize
-                }
-            } else if num_tag_bytes == 1 {
-                if s >= src.len() {
-                    return Err(Error::CopyRead {
-                        len: 1,
-                        src_len: (src.len() - s) as u64,
-                    });
-                }
-                src[s] as usize
-            } else if num_tag_bytes == 2 {
-                if s + 1 >= src.len() {
-                    return Err(Error::CopyRead {
-                        len: 2,
-                        src_len: (src.len() - s) as u64,
-                    });
-                }
-                bytes::read_u16_le(&src[s..]) as usize
-            } else {
-                return Err(Error::CopyRead {
-                    len: num_tag_bytes as u64,
-                    src_len: (src.len() - s) as u64,
-                });
-            };
-        Ok((self.0 & 0b0000_0111_0000_0000) | trailer)
-    }
-}
