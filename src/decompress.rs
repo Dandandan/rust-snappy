@@ -382,7 +382,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
 
         loop {
             let byte = preload as u8;
-            let mut reload = true;
 
             if byte & 3 != 0 {
                 let entry_val = TAG_LOOKUP_TABLE[byte as usize] as usize;
@@ -429,7 +428,15 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 }
 
                 preload = loaded >> (tag_type as u32 * 8);
-                reload = tag_type == 3;
+                if ip > ip_limit || op > op_limit {
+                    break;
+                }
+                // Copy-1/copy-2: next tag byte is already in preload.
+                // Copy-4: need to reload from memory.
+                if tag_type < 3 {
+                    continue;
+                }
+                preload = *ip as u32;
             } else {
                 let len = (byte >> 2) as usize + 1;
                 ip = ip.add(1);
@@ -469,12 +476,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         d = self.d;
                     }
                 }
-            }
-
-            if ip > ip_limit || op > op_limit {
-                break;
-            }
-            if reload {
+                if ip > ip_limit || op > op_limit {
+                    break;
+                }
                 preload = *ip as u32;
             }
         }
