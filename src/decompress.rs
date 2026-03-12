@@ -297,7 +297,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
             }
 
             // Single unified bounds check and preload for all paths.
-            if !(ip <= ip_limit && op <= op_limit) {
+            if ip > ip_limit || op > op_limit {
                 break;
             }
             if reload {
