@@ -268,12 +268,24 @@ impl<'s, 'd> Decompress<'s, 'd> {
 
                 if byte & 3 == 0 {
                     let len = (byte >> 2) as usize + 1;
-                    self.s = ip.offset_from(src) as usize;
-                    self.d = d;
-                    self.read_literal(len)?;
-                    ip = src.add(self.s);
-                    op = dst_base.add(self.d);
-                    d = self.d;
+                    // Inline short literals: single 16-byte copy avoids
+                    // the overhead of syncing ip/op through self.
+                    if len <= 16
+                        && ip.add(16) <= src_end
+                        && op.add(16) <= dst_end
+                    {
+                        ptr::copy_nonoverlapping(ip, op, 16);
+                        ip = ip.add(len);
+                        op = op.add(len);
+                        d += len;
+                    } else {
+                        self.s = ip.offset_from(src) as usize;
+                        self.d = d;
+                        self.read_literal(len)?;
+                        ip = src.add(self.s);
+                        op = dst_base.add(self.d);
+                        d = self.d;
+                    }
                 } else {
                     let entry_val = TAG_LOOKUP_TABLE[byte as usize] as usize;
                     let tag_type = (byte & 3) as usize;
@@ -322,7 +334,12 @@ impl<'s, 'd> Decompress<'s, 'd> {
 
                     if end.add(24) <= dst_end {
                         copy_dispatch(op, offset, len);
+                    } else if offset >= len {
+                        // Non-overlapping: safe to copy directly.
+                        ptr::copy_nonoverlapping(op.sub(offset), op, len);
                     } else {
+                        // Overlapping (offset < len): forward byte-by-byte
+                        // to correctly expand the repeated pattern.
                         let mut p = op;
                         while p < end {
                             *p = *p.sub(offset);
