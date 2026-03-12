@@ -271,8 +271,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     // Inline short literals: single 16-byte copy avoids
                     // the overhead of syncing ip/op through self.
                     if len <= 16
-                        && ip.add(16) <= src_end
-                        && op.add(16) <= dst_end
+                        && (ip as usize + 16) <= (src_end as usize)
+                        && d + 16 <= self.dst.len()
                     {
                         ptr::copy_nonoverlapping(ip, op, 16);
                         ip = ip.add(len);
@@ -292,14 +292,14 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     let num_tag_bytes = tag_type + (tag_type == 3) as usize;
                     let len = entry_val & 0xFF;
 
-                    if ip.add(num_tag_bytes) > src_end {
+                    if (ip as usize + num_tag_bytes) > (src_end as usize) {
                         return Err(Error::CopyRead {
                             len: num_tag_bytes as u64,
                             src_len: src_end.offset_from(ip) as u64,
                         });
                     }
 
-                    let loaded = if ip.add(4) <= src_end {
+                    let loaded = if (ip as usize + 4) <= (src_end as usize) {
                         bytes::loadu_u32_le(ip)
                     } else {
                         let mut v = 0u32;
@@ -322,8 +322,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         });
                     }
 
-                    let end = op.add(len);
-                    if end > dst_end {
+                    if d + len > self.dst.len() {
                         self.s = ip.offset_from(src) as usize;
                         self.d = d;
                         return Err(Error::CopyWrite {
@@ -340,13 +339,14 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     } else {
                         // Overlapping (offset < len): forward byte-by-byte
                         // to correctly expand the repeated pattern.
+                        let end = op.add(len);
                         let mut p = op;
                         while p < end {
                             *p = *p.sub(offset);
                             p = p.add(1);
                         }
                     }
-                    op = end;
+                    op = op.add(len);
                     d += len;
                 }
             }
@@ -467,8 +467,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     {
                         d += len;
                     }
-                } else if len <= 60
-                    && (ip as usize + 64) <= (src_end as usize)
+                } else if len <= 60 && (ip as usize + 64) <= (src_end as usize)
                 {
                     wide_copy_long(ip, op, len);
                     ip = ip.add(len);
