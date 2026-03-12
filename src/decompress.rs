@@ -332,7 +332,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         });
                     }
 
-                    if op.add(64) <= dst_end {
+                    if d + 64 <= self.dst.len() {
                         copy_dispatch(op, offset, len);
                     } else if offset >= len {
                         // Non-overlapping: safe to copy directly.
@@ -371,7 +371,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// On x86: uses integer `d` for offset check (saves a register),
     /// compact copy dispatch (cold paths out-of-line to reduce i-cache
     /// pressure).
-    #[inline(always)]
+    /// x86: out-of-line gives isolated register allocation (14 GPRs, no
+    /// spills). ARM: LLVM inlines regardless (31 GPRs, no pressure).
+    #[cfg_attr(not(target_arch = "aarch64"), inline(never))]
     unsafe fn decompress_fast(&mut self) -> Result<()> {
         let src = self.src.as_ptr();
         let dst_base = self.dst.as_mut_ptr();
