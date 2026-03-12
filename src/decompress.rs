@@ -38,13 +38,23 @@ unsafe fn wide_copy_long(src: *const u8, dst: *mut u8, len: usize) {
 }
 
 
-/// Extract the offset mask for a given tag_type (1, 2, or 3) using a
-/// packed constant, avoiding the dependency chain through num_tag_bytes.
+/// Extract the offset mask for a given tag_type (1, 2, or 3).
 /// Returns a mask: tag_type=1 → 0xFF, tag_type=2 → 0xFFFF, tag_type=3 → 0.
+///
+/// On ARM, uses a packed u64 constant with shift (avoids memory load).
+/// On x86, uses an array lookup (avoids 10-byte movabs + variable shift).
 #[inline(always)]
 fn extract_offset_mask(tag_type: usize) -> u32 {
-    const MASKS_PACKED: u64 = 0x0000FFFF00FF0000u64;
-    ((MASKS_PACKED >> (tag_type * 16)) & 0xFFFF) as u32
+    #[cfg(target_arch = "aarch64")]
+    {
+        const MASKS_PACKED: u64 = 0x0000FFFF00FF0000u64;
+        ((MASKS_PACKED >> (tag_type * 16)) & 0xFFFF) as u32
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        const MASKS: [u32; 4] = [0, 0xFF, 0xFFFF, 0];
+        MASKS[tag_type]
+    }
 }
 
 /// Copy `len` bytes from `dst - offset` into `dst`, handling overlapping
@@ -257,9 +267,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 let offset = (entry_val & 0x700) | extracted;
                 ip = ip.add(num_tag_bytes);
 
-                if (op as usize).wrapping_sub(offset) < dst_base_addr
-                    || offset == 0
-                {
+                // Compute copy source once; reuse for bounds check and copy.
+                let srcp = op.sub(offset);
+                if (srcp as usize) < dst_base_addr || offset == 0 {
                     self.s = ip.offset_from(src) as usize;
                     self.d = op.offset_from(dst_base) as usize;
                     return Err(Error::Offset {
@@ -269,15 +279,14 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 }
 
                 if len <= 16 && offset >= 8 {
-                    let srcp = op.sub(offset);
                     ptr::copy_nonoverlapping(srcp, op, 8);
                     ptr::copy_nonoverlapping(srcp.add(8), op.add(8), 8);
                     op = op.add(len);
                 } else if offset >= 32 {
-                    wide_copy_long(op.sub(offset), op, len);
+                    wide_copy_long(srcp, op, len);
                     op = op.add(len);
                 } else if offset >= 16 {
-                    wide_copy(op.sub(offset), op, len);
+                    wide_copy(srcp, op, len);
                     op = op.add(len);
                 } else {
                     overlapping_copy(op, offset, len);
