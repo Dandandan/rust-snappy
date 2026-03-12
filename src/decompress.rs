@@ -5,8 +5,10 @@ use crate::error::{Error, Result};
 use crate::tag;
 use crate::MAX_INPUT_SIZE;
 
-/// A lookup table for quickly computing the various attributes derived from a
-/// tag byte. See the comment above `TagLookupTable` for the bit layout.
+/// Tag lookup table. Keys are tag bytes, values are u16 with bit layout:
+///   xxaa abbb xxcc cccc
+/// Where `a` = num_tag_bytes (1/2/4), `b` = offset high bits (copy 1 only),
+/// `c` = copy length (max 64).
 const TAG_LOOKUP_TABLE: [u16; 256] = tag::TAG_LOOKUP_TABLE;
 
 /// Copy up to 64 bytes using unrolled 16-byte copies.
@@ -237,16 +239,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
         Ok(())
     }
 
-    /// Fast decompression loop using raw pointers for common cases.
-    ///
-    /// Fast decompression loop using raw pointers for common cases.
-    ///
-    /// The loop condition guarantees sufficient headroom in both source and
-    /// destination buffers to eliminate most bounds checks from the loop body:
-    /// - `s + 17 <= src_len`: ensures 16 bytes of literal data + 1 tag byte
-    ///   can always be read, and 4 bytes of copy offset data (since 17 > 5).
-    /// - `d + 88 <= dst_len`: ensures max copy (64 bytes) + overlapping_copy
-    ///   wiggle room (24 bytes) always fits, so no destination checks needed.
+    /// Fast inner loop using raw pointers. Requires 17 bytes of source
+    /// headroom and 88 bytes of destination headroom to avoid bounds checks.
     #[inline(always)]
     unsafe fn decompress_fast(&mut self) -> Result<()> {
         let src = self.src.as_ptr();
@@ -258,7 +252,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
             return Ok(());
         }
 
-        // Use raw pointers for the hot loop to avoid base+offset additions.
         let mut ip = src.add(self.s);
         let mut op = dst_base.add(self.d);
         let ip_limit = src.add(src_len - 17);
@@ -270,8 +263,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
 
         loop {
             let byte = preload as u8;
-            // Track whether we need to reload preload from memory
-            // (literals always, Copy4 always, Copy1/Copy2 never).
             let mut reload = true;
 
             if byte & 3 != 0 {
@@ -287,7 +278,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 let offset = (entry_val & 0x700) | extracted;
                 ip = ip.add(num_tag_bytes);
 
-                // Compute copy source once; reuse for bounds check and copy.
                 let srcp = op.sub(offset);
                 if (srcp as usize) < dst_base_addr || offset == 0 {
                     self.s = ip.offset_from(src) as usize;
@@ -301,9 +291,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 copy_dispatch(op, offset, len);
                 op = op.add(len);
 
-                // Preload next tag from the trailer for Copy1/Copy2.
-                // For Copy4 (num_tag_bytes=4), shift is 32 → result is 0,
-                // but reload=true overwrites it anyway.
                 preload = loaded >> (tag_type as u32 * 8);
                 reload = tag_type == 3;
             } else {
@@ -328,7 +315,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 }
             }
 
-            // Single unified bounds check and preload for all paths.
             if ip > ip_limit || op > op_limit {
                 break;
             }
@@ -355,34 +341,20 @@ impl<'s, 'd> Decompress<'s, 'd> {
     fn read_literal(&mut self, len: usize) -> Result<()> {
         debug_assert!(len <= 64);
         let mut len = len as u64;
-        // As an optimization for the common case, if the literal length is
-        // <=16 and we have enough room in both `src` and `dst`, copy the
-        // literal using unaligned loads and stores.
-        //
-        // We pick 16 bytes with the hope that it optimizes down to a 128 bit
-        // load/store.
         if len <= 16
             && self.s + 16 <= self.src.len()
             && self.d + 16 <= self.dst.len()
         {
             unsafe {
-                // SAFETY: We know both src and dst have at least 16 bytes of
-                // wiggle room after s/d, even if `len` is <16, so the copy is
-                // safe.
                 let srcp = self.src.as_ptr().add(self.s);
                 let dstp = self.dst.as_mut_ptr().add(self.d);
-                // Hopefully uses SIMD registers for 128 bit load/store.
                 ptr::copy_nonoverlapping(srcp, dstp, 16);
             }
             self.d += len as usize;
             self.s += len as usize;
             return Ok(());
         }
-        // When the length is bigger than 60, it indicates that we need to read
-        // an additional 1-4 bytes to get the real length of the literal.
         if len >= 61 {
-            // If there aren't at least 4 bytes left to read then we know this
-            // is corrupt because the literal must have length >=61.
             if self.s as u64 + 4 > self.src.len() as u64 {
                 return Err(Error::Literal {
                     len: 4,
@@ -390,17 +362,12 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     dst_len: (self.dst.len() - self.d) as u64,
                 });
             }
-            // Since we know there are 4 bytes left to read, read a 32 bit LE
-            // integer and mask away the bits we don't need.
             let byte_count = len as usize - 60;
             let mask = u32::MAX >> ((4 - byte_count as u32) << 3);
             len = bytes::read_u32_le(&self.src[self.s..]) as u64;
             len = (len & mask as u64) + 1;
             self.s += byte_count;
         }
-        // If there's not enough buffer left to load or store this literal,
-        // then the input is corrupt.
-        // if self.s + len > self.src.len() || self.d + len > self.dst.len() {
         if ((self.src.len() - self.s) as u64) < len
             || ((self.dst.len() - self.d) as u64) < len
         {
@@ -411,8 +378,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
             });
         }
         unsafe {
-            // SAFETY: We've already checked the bounds, so we know this copy
-            // is correct.
             let srcp = self.src.as_ptr().add(self.s);
             let dstp = self.dst.as_mut_ptr().add(self.d);
             ptr::copy_nonoverlapping(srcp, dstp, len as usize);
@@ -422,8 +387,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
         Ok(())
     }
 
-    /// Reads a copy from `src` and writes the decompressed bytes to `dst`. `s`
-    /// should point to the byte immediately proceding the copy tag byte.
+    /// Reads a copy tag and writes the decompressed bytes.
     #[inline(always)]
     fn read_copy(&mut self, tag_byte: u8) -> Result<()> {
         let entry_val = TAG_LOOKUP_TABLE[tag_byte as usize] as usize;
@@ -463,10 +427,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let offset = (entry_val & 0x700) | trailer;
         self.s += num_tag_bytes;
 
-        // What we really care about here is whether `d == 0` or `d < offset`.
-        // To save an extra branch, use `d < offset - 1` instead. If `d` is
-        // `0`, then `offset.wrapping_sub(1)` will be usize::MAX which is also
-        // the max value of `d`.
         if self.d <= offset.wrapping_sub(1) {
             return Err(Error::Offset {
                 offset: offset as u64,
