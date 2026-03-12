@@ -331,7 +331,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         });
                     }
 
-                    if d + 64 <= self.dst.len() {
+                    if d + 88 <= self.dst.len() {
                         copy_dispatch(op, offset, len);
                     } else if offset >= len {
                         // Non-overlapping: safe to copy directly.
