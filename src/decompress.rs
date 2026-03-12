@@ -11,8 +11,8 @@ const TAG_LOOKUP_TABLE: TagLookupTable = TagLookupTable(tag::TAG_LOOKUP_TABLE);
 
 
 /// Copy up to 64 bytes using unrolled 16-byte copies.
-/// `src` and `dst` must not overlap and must have at least `len + 16` bytes
-/// of addressable memory (we always copy in 16-byte chunks).
+/// `src` and `dst` must not overlap in each 16-byte chunk.
+/// Use `wide_copy_long` when src and dst are guaranteed >= 32 apart.
 #[inline(always)]
 unsafe fn wide_copy(src: *const u8, dst: *mut u8, len: usize) {
     debug_assert!(len <= 64);
@@ -23,6 +23,17 @@ unsafe fn wide_copy(src: *const u8, dst: *mut u8, len: usize) {
         if len > 48 {
             ptr::copy_nonoverlapping(src.add(48), dst.add(48), 16);
         }
+    }
+}
+
+/// Copy up to 64 bytes using 32-byte copies (ldp/stp q pairs on ARM).
+/// Requires src and dst to be at least 32 bytes apart (no overlap).
+#[inline(always)]
+unsafe fn wide_copy_long(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len <= 64);
+    ptr::copy_nonoverlapping(src, dst, 32);
+    if len > 32 {
+        ptr::copy_nonoverlapping(src.add(32), dst.add(32), 32);
     }
 }
 
@@ -262,6 +273,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     ptr::copy_nonoverlapping(srcp, op, 8);
                     ptr::copy_nonoverlapping(srcp.add(8), op.add(8), 8);
                     op = op.add(len);
+                } else if offset >= 32 {
+                    wide_copy_long(op.sub(offset), op, len);
+                    op = op.add(len);
                 } else if offset >= 16 {
                     wide_copy(op.sub(offset), op, len);
                     op = op.add(len);
@@ -284,7 +298,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     && (ip as usize + len + 16)
                         <= (src_end as usize)
                 {
-                    wide_copy(ip, op, len);
+                    wide_copy_long(ip, op, len);
                     ip = ip.add(len);
                     op = op.add(len);
                 } else {
