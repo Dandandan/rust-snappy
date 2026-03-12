@@ -220,15 +220,89 @@ impl<'s, 'd> Decompress<'s, 'd> {
         unsafe {
             self.decompress_fast()?;
         }
-        while self.s < self.src.len() {
-            let byte = self.src[self.s];
-            self.s += 1;
-            if byte & 0b000000_11 == 0 {
-                let len = (byte >> 2) as usize + 1;
-                self.read_literal(len)?;
-            } else {
-                self.read_copy(byte)?;
+        // Slow tail: process remaining bytes with bounds checks.
+        // Uses raw pointers like the fast path for consistency.
+        unsafe {
+            let src = self.src.as_ptr();
+            let dst_base = self.dst.as_mut_ptr();
+            let src_end = src.add(self.src.len());
+            let dst_end = dst_base.add(self.dst.len());
+            let dst_base_addr = dst_base as usize;
+            let mut ip = src.add(self.s);
+            let mut op = dst_base.add(self.d);
+
+            while ip < src_end {
+                let byte = *ip;
+                ip = ip.add(1);
+
+                if byte & 3 == 0 {
+                    let len = (byte >> 2) as usize + 1;
+                    self.s = ip.offset_from(src) as usize;
+                    self.d = op.offset_from(dst_base) as usize;
+                    self.read_literal(len)?;
+                    ip = src.add(self.s);
+                    op = dst_base.add(self.d);
+                } else {
+                    let entry_val = TAG_LOOKUP_TABLE[byte as usize] as usize;
+                    let tag_type = (byte & 3) as usize;
+                    let num_tag_bytes = tag_type + (tag_type == 3) as usize;
+                    let len = entry_val & 0xFF;
+
+                    if ip.add(num_tag_bytes) > src_end {
+                        return Err(Error::CopyRead {
+                            len: num_tag_bytes as u64,
+                            src_len: src_end.offset_from(ip) as u64,
+                        });
+                    }
+
+                    let loaded = if ip.add(4) <= src_end {
+                        bytes::loadu_u32_le(ip)
+                    } else {
+                        let mut v = 0u32;
+                        for i in 0..num_tag_bytes {
+                            v |= (*ip.add(i) as u32) << (i * 8);
+                        }
+                        v
+                    };
+                    let extracted =
+                        (loaded & extract_offset_mask(tag_type)) as usize;
+                    let offset = (entry_val & 0x700) | extracted;
+                    ip = ip.add(num_tag_bytes);
+
+                    let srcp = op.sub(offset);
+                    if (srcp as usize) < dst_base_addr || offset == 0 {
+                        self.s = ip.offset_from(src) as usize;
+                        self.d = op.offset_from(dst_base) as usize;
+                        return Err(Error::Offset {
+                            offset: offset as u64,
+                            dst_pos: self.d as u64,
+                        });
+                    }
+
+                    let end = op.add(len);
+                    if end > dst_end {
+                        self.s = ip.offset_from(src) as usize;
+                        self.d = op.offset_from(dst_base) as usize;
+                        return Err(Error::CopyWrite {
+                            len: len as u64,
+                            dst_len: (self.dst.len() - self.d) as u64,
+                        });
+                    }
+
+                    if end.add(24) <= dst_end {
+                        copy_dispatch(op, offset, len);
+                    } else {
+                        let mut p = op;
+                        while p < end {
+                            *p = *p.sub(offset);
+                            p = p.add(1);
+                        }
+                    }
+                    op = end;
+                }
             }
+            self.s = ip.offset_from(src) as usize;
+            self.d = op.offset_from(dst_base) as usize;
         }
         if self.d != self.dst.len() {
             return Err(Error::HeaderMismatch {
@@ -384,74 +458,6 @@ impl<'s, 'd> Decompress<'s, 'd> {
         }
         self.s += len as usize;
         self.d += len as usize;
-        Ok(())
-    }
-
-    /// Reads a copy tag and writes the decompressed bytes.
-    #[inline(always)]
-    fn read_copy(&mut self, tag_byte: u8) -> Result<()> {
-        let entry_val = TAG_LOOKUP_TABLE[tag_byte as usize] as usize;
-        let tag_type = (tag_byte & 3) as usize;
-        let num_tag_bytes = tag_type + (tag_type == 3) as usize;
-        let len = entry_val & 0xFF;
-
-        // Read offset from compressed input.
-        let trailer = if self.s + 4 <= self.src.len() {
-            unsafe {
-                let p = self.src.as_ptr().add(self.s);
-                let mask = u32::MAX >> ((4 - num_tag_bytes as u32) << 3);
-                bytes::loadu_u32_le(p) as usize & mask as usize
-            }
-        } else if num_tag_bytes == 1 {
-            if self.s >= self.src.len() {
-                return Err(Error::CopyRead {
-                    len: 1,
-                    src_len: (self.src.len() - self.s) as u64,
-                });
-            }
-            self.src[self.s] as usize
-        } else if num_tag_bytes == 2 {
-            if self.s + 1 >= self.src.len() {
-                return Err(Error::CopyRead {
-                    len: 2,
-                    src_len: (self.src.len() - self.s) as u64,
-                });
-            }
-            bytes::read_u16_le(&self.src[self.s..]) as usize
-        } else {
-            return Err(Error::CopyRead {
-                len: num_tag_bytes as u64,
-                src_len: (self.src.len() - self.s) as u64,
-            });
-        };
-        let offset = (entry_val & 0x700) | trailer;
-        self.s += num_tag_bytes;
-
-        if self.d <= offset.wrapping_sub(1) {
-            return Err(Error::Offset {
-                offset: offset as u64,
-                dst_pos: self.d as u64,
-            });
-        }
-        let end = self.d + len;
-        if end + 24 <= self.dst.len() {
-            unsafe {
-                copy_dispatch(self.dst.as_mut_ptr().add(self.d), offset, len);
-            }
-        } else {
-            if end > self.dst.len() {
-                return Err(Error::CopyWrite {
-                    len: len as u64,
-                    dst_len: (self.dst.len() - self.d) as u64,
-                });
-            }
-            // Byte-by-byte fallback for the last few bytes.
-            while self.d != end {
-                self.dst[self.d] = self.dst[self.d - offset];
-                self.d += 1;
-            }
-        }
-        self.d = end;
         Ok(())
     }
 }
