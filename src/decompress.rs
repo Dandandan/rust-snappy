@@ -476,11 +476,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let end = self.d + len;
         if end + 24 <= self.dst.len() {
             unsafe {
-                copy_dispatch(
-                    self.dst.as_mut_ptr().add(self.d),
-                    offset,
-                    len,
-                );
+                copy_dispatch(self.dst.as_mut_ptr().add(self.d), offset, len);
             }
         } else {
             if end > self.dst.len() {
@@ -530,5 +526,3 @@ impl Header {
         Ok(Header { len: header_len, decompress_len: decompress_len as usize })
     }
 }
-
-
