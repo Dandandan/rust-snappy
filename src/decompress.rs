@@ -14,7 +14,7 @@ const TAG_LOOKUP_TABLE: [u16; 256] = tag::TAG_LOOKUP_TABLE;
 /// Copy up to 64 bytes using unrolled 16-byte copies.
 /// `src` and `dst` must not overlap in each 16-byte chunk.
 /// Use `wide_copy_long` when src and dst are guaranteed >= 32 apart.
-#[inline(always)]
+#[inline]
 unsafe fn wide_copy(src: *const u8, dst: *mut u8, len: usize) {
     debug_assert!(len <= 64);
     ptr::copy_nonoverlapping(src, dst, 16);
@@ -57,6 +57,20 @@ fn extract_offset_mask(tag_type: usize) -> u32 {
     }
 }
 
+/// Cold path for copy dispatch — handles len > 16 or offset < 8 cases.
+/// Kept out-of-line on x86 to reduce i-cache pressure in the hot loop.
+#[inline(never)]
+unsafe fn copy_dispatch_cold(dst: *mut u8, offset: usize, len: usize) {
+    let srcp = dst.sub(offset);
+    if offset >= 32 {
+        wide_copy_long(srcp, dst, len);
+    } else if offset >= 16 {
+        wide_copy(srcp, dst, len);
+    } else {
+        overlapping_copy(dst, offset, len);
+    }
+}
+
 /// Dispatch a copy of `len` bytes from `dst - offset` to `dst`.
 ///
 /// Tries fast wide-copy paths (non-overlapping 8/16/32 byte chunks).
@@ -64,18 +78,31 @@ fn extract_offset_mask(tag_type: usize) -> u32 {
 ///
 /// Caller must ensure at least `len + 24` bytes of writable space at `dst`
 /// and at least `offset` valid bytes preceding `dst`.
+///
+/// On ARM: all paths are inlined (plenty of registers and i-cache).
+/// On x86: only the hot path (len≤16, offset≥8) is inlined; the rest
+/// goes through `copy_dispatch_cold` to keep the loop compact.
 #[inline(always)]
 unsafe fn copy_dispatch(dst: *mut u8, offset: usize, len: usize) {
     let srcp = dst.sub(offset);
     if len <= 16 && offset >= 8 {
         ptr::copy_nonoverlapping(srcp, dst, 8);
         ptr::copy_nonoverlapping(srcp.add(8), dst.add(8), 8);
-    } else if offset >= 32 {
-        wide_copy_long(srcp, dst, len);
-    } else if offset >= 16 {
-        wide_copy(srcp, dst, len);
     } else {
-        overlapping_copy(dst, offset, len);
+        #[cfg(target_arch = "aarch64")]
+        {
+            if offset >= 32 {
+                wide_copy_long(srcp, dst, len);
+            } else if offset >= 16 {
+                wide_copy(srcp, dst, len);
+            } else {
+                overlapping_copy(dst, offset, len);
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            copy_dispatch_cold(dst, offset, len);
+        }
     }
 }
 
@@ -85,7 +112,7 @@ unsafe fn copy_dispatch(dst: *mut u8, offset: usize, len: usize) {
 ///
 /// Caller must ensure `dst + len + 24` is writable and that `dst` is
 /// preceded by at least `offset` valid bytes.
-#[inline(always)]
+#[inline(never)]
 unsafe fn overlapping_copy(dst: *mut u8, offset: usize, len: usize) {
     let end = dst.add(len);
     let mut dstp = dst;
@@ -217,6 +244,10 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// This assumes that the header has already been read and that `dst` is
     /// big enough to store all decompressed bytes.
     fn decompress(&mut self) -> Result<()> {
+        // Fast inner loop: processes bulk data without bounds checks,
+        // with tag preloading. ARM: fully inlined copies, pointer-based
+        // offset check (ccmp fusion). x86: compact copies (cold paths
+        // out-of-line), integer offset check.
         unsafe {
             self.decompress_fast()?;
         }
@@ -227,9 +258,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let dst_base = self.dst.as_mut_ptr();
             let src_end = src.add(self.src.len());
             let dst_end = dst_base.add(self.dst.len());
-            let dst_base_addr = dst_base as usize;
             let mut ip = src.add(self.s);
             let mut op = dst_base.add(self.d);
+            let mut d = self.d;
 
             while ip < src_end {
                 let byte = *ip;
@@ -238,10 +269,11 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 if byte & 3 == 0 {
                     let len = (byte >> 2) as usize + 1;
                     self.s = ip.offset_from(src) as usize;
-                    self.d = op.offset_from(dst_base) as usize;
+                    self.d = d;
                     self.read_literal(len)?;
                     ip = src.add(self.s);
                     op = dst_base.add(self.d);
+                    d = self.d;
                 } else {
                     let entry_val = TAG_LOOKUP_TABLE[byte as usize] as usize;
                     let tag_type = (byte & 3) as usize;
@@ -269,23 +301,22 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     let offset = (entry_val & 0x700) | extracted;
                     ip = ip.add(num_tag_bytes);
 
-                    let srcp = op.sub(offset);
-                    if (srcp as usize) < dst_base_addr || offset == 0 {
+                    if d <= offset.wrapping_sub(1) {
                         self.s = ip.offset_from(src) as usize;
-                        self.d = op.offset_from(dst_base) as usize;
+                        self.d = d;
                         return Err(Error::Offset {
                             offset: offset as u64,
-                            dst_pos: self.d as u64,
+                            dst_pos: d as u64,
                         });
                     }
 
                     let end = op.add(len);
                     if end > dst_end {
                         self.s = ip.offset_from(src) as usize;
-                        self.d = op.offset_from(dst_base) as usize;
+                        self.d = d;
                         return Err(Error::CopyWrite {
                             len: len as u64,
-                            dst_len: (self.dst.len() - self.d) as u64,
+                            dst_len: (self.dst.len() - d) as u64,
                         });
                     }
 
@@ -299,10 +330,11 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         }
                     }
                     op = end;
+                    d += len;
                 }
             }
             self.s = ip.offset_from(src) as usize;
-            self.d = op.offset_from(dst_base) as usize;
+            self.d = d;
         }
         if self.d != self.dst.len() {
             return Err(Error::HeaderMismatch {
@@ -315,6 +347,13 @@ impl<'s, 'd> Decompress<'s, 'd> {
 
     /// Fast inner loop using raw pointers. Requires 17 bytes of source
     /// headroom and 88 bytes of destination headroom to avoid bounds checks.
+    /// Uses tag preloading to avoid an extra memory load per iteration.
+    ///
+    /// On ARM: uses pointer-based offset check (enables `ccmp` fusion),
+    /// fully inlined copy helpers, 31 GPRs keep everything in registers.
+    /// On x86: uses integer `d` for offset check (saves a register),
+    /// compact copy dispatch (cold paths out-of-line to reduce i-cache
+    /// pressure).
     #[inline(always)]
     unsafe fn decompress_fast(&mut self) -> Result<()> {
         let src = self.src.as_ptr();
@@ -331,7 +370,13 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let ip_limit = src.add(src_len - 17);
         let op_limit = dst_base.add(dst_len - 88);
         let src_end = src.add(src_len);
+
+        // ARM: pointer comparison for offset check (enables ccmp fusion).
+        #[cfg(target_arch = "aarch64")]
         let dst_base_addr = dst_base as usize;
+        // x86: integer `d` for offset check (avoids extra pointer register).
+        #[cfg(not(target_arch = "aarch64"))]
+        let mut d = self.d;
 
         let mut preload = *ip as u32;
 
@@ -352,18 +397,36 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 let offset = (entry_val & 0x700) | extracted;
                 ip = ip.add(num_tag_bytes);
 
-                let srcp = op.sub(offset);
-                if (srcp as usize) < dst_base_addr || offset == 0 {
-                    self.s = ip.offset_from(src) as usize;
-                    self.d = op.offset_from(dst_base) as usize;
-                    return Err(Error::Offset {
-                        offset: offset as u64,
-                        dst_pos: self.d as u64,
-                    });
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let srcp = op.sub(offset);
+                    if (srcp as usize) < dst_base_addr || offset == 0 {
+                        self.s = ip.offset_from(src) as usize;
+                        self.d = op.offset_from(dst_base) as usize;
+                        return Err(Error::Offset {
+                            offset: offset as u64,
+                            dst_pos: self.d as u64,
+                        });
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    if d <= offset.wrapping_sub(1) {
+                        self.s = ip.offset_from(src) as usize;
+                        self.d = d;
+                        return Err(Error::Offset {
+                            offset: offset as u64,
+                            dst_pos: d as u64,
+                        });
+                    }
                 }
 
                 copy_dispatch(op, offset, len);
                 op = op.add(len);
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    d += len;
+                }
 
                 preload = loaded >> (tag_type as u32 * 8);
                 reload = tag_type == 3;
@@ -374,18 +437,37 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     ptr::copy_nonoverlapping(ip, op, 16);
                     ip = ip.add(len);
                     op = op.add(len);
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        d += len;
+                    }
                 } else if len <= 60
                     && (ip as usize + len + 16) <= (src_end as usize)
                 {
                     wide_copy_long(ip, op, len);
                     ip = ip.add(len);
                     op = op.add(len);
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        d += len;
+                    }
                 } else {
                     self.s = ip.offset_from(src) as usize;
-                    self.d = op.offset_from(dst_base) as usize;
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        self.d = op.offset_from(dst_base) as usize;
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        self.d = d;
+                    }
                     self.read_literal(len)?;
                     ip = src.add(self.s);
                     op = dst_base.add(self.d);
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        d = self.d;
+                    }
                 }
             }
 
@@ -397,7 +479,14 @@ impl<'s, 'd> Decompress<'s, 'd> {
             }
         }
         self.s = ip.offset_from(src) as usize;
-        self.d = op.offset_from(dst_base) as usize;
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.d = op.offset_from(dst_base) as usize;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            self.d = d;
+        }
         Ok(())
     }
 
