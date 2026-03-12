@@ -332,7 +332,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         });
                     }
 
-                    if end.add(24) <= dst_end {
+                    if op.add(64) <= dst_end {
                         copy_dispatch(op, offset, len);
                     } else if offset >= len {
                         // Non-overlapping: safe to copy directly.
