@@ -398,22 +398,23 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let mut d = self.d;
 
         let mut preload = *ip as u32;
+        let mut next_entry = TAG_LOOKUP_TABLE[preload as u8 as usize] as usize;
+        let mut next_loaded = bytes::loadu_u32_le(ip.add(1));
 
         loop {
             let byte = preload as u8;
 
             if byte & 3 != 0 {
-                let entry_val = TAG_LOOKUP_TABLE[byte as usize] as usize;
+                let entry_val = next_entry;
+                let loaded = next_loaded;
                 let tag_type = (byte & 3) as usize;
                 let num_tag_bytes = tag_type + (tag_type == 3) as usize;
                 let len = entry_val & 0xFF;
-                ip = ip.add(1);
+                ip = ip.add(1 + num_tag_bytes);
 
-                let loaded = bytes::loadu_u32_le(ip);
                 let extracted =
                     (loaded & extract_offset_mask(tag_type)) as usize;
                 let offset = (entry_val & 0x700) | extracted;
-                ip = ip.add(num_tag_bytes);
 
                 #[cfg(target_arch = "aarch64")]
                 {
@@ -439,6 +440,16 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     }
                 }
 
+                // Compute next iteration's preload + start its
+                // table lookup and offset load early, so they
+                // execute in parallel with copy_dispatch stores.
+                preload = loaded >> (tag_type as u32 * 8);
+                if tag_type >= 3 {
+                    preload = *ip as u32;
+                }
+                next_entry = TAG_LOOKUP_TABLE[preload as u8 as usize] as usize;
+                next_loaded = bytes::loadu_u32_le(ip.add(1));
+
                 copy_dispatch(op, offset, len);
                 op = op.add(len);
                 #[cfg(not(target_arch = "aarch64"))]
@@ -446,16 +457,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     d += len;
                 }
 
-                preload = loaded >> (tag_type as u32 * 8);
                 if ip > ip_limit || op > op_limit {
                     break;
                 }
-                // Copy-1/copy-2: next tag byte is already in preload.
-                // Copy-4: need to reload from memory.
-                if tag_type < 3 {
-                    continue;
-                }
-                preload = *ip as u32;
             } else {
                 let len = (byte >> 2) as usize + 1;
                 ip = ip.add(1);
@@ -498,6 +502,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     break;
                 }
                 preload = *ip as u32;
+                next_entry = TAG_LOOKUP_TABLE[preload as u8 as usize] as usize;
+                next_loaded = bytes::loadu_u32_le(ip.add(1));
             }
         }
         self.s = ip.offset_from(src) as usize;
