@@ -408,12 +408,22 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 let entry_val = next_entry;
                 let loaded = next_loaded;
                 let tag_type = (byte & 3) as usize;
-                let num_tag_bytes = tag_type + (tag_type == 3) as usize;
-                let len = entry_val & 0xFF;
-                ip = ip.add(1 + num_tag_bytes);
 
-                let extracted =
-                    (loaded & extract_offset_mask(tag_type)) as usize;
+                // Copy-4 never occurs in compressor output.
+                // In the fast loop it always produces offset=0
+                // (error), so bail to the slow tail directly.
+                if tag_type == 3 {
+                    break;
+                }
+
+                let len = entry_val & 0xFF;
+                // tag_type is 1 or 2, so num_tag_bytes = tag_type.
+                ip = ip.add(1 + tag_type);
+
+                // Shift-based mask: tag_type is guaranteed 1 or 2,
+                // so (1 << 8)-1 = 0xFF or (1 << 16)-1 = 0xFFFF.
+                let mask = (1u32 << (tag_type as u32 * 8)).wrapping_sub(1);
+                let extracted = (loaded & mask) as usize;
                 let offset = (entry_val & 0x700) | extracted;
 
                 #[cfg(target_arch = "aarch64")]
@@ -440,13 +450,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     }
                 }
 
-                // Compute next iteration's preload + start its
-                // table lookup and offset load early, so they
-                // execute in parallel with copy_dispatch stores.
+                // Preload next tag from the already-loaded data.
+                // tag_type is 1 or 2, so shift is 8 or 16.
                 preload = loaded >> (tag_type as u32 * 8);
-                if tag_type >= 3 {
-                    preload = *ip as u32;
-                }
                 next_entry = TAG_LOOKUP_TABLE[preload as u8 as usize] as usize;
                 next_loaded = bytes::loadu_u32_le(ip.add(1));
 
